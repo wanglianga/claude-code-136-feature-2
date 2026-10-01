@@ -21,6 +21,17 @@ const (
 	DeviceOfflineAfter = 60 * time.Second // 设备心跳超时判定离线
 	RefundRate         = 0.8              // 退款折算系数
 	VerifyCodeMock     = "123456"         // 演示环境模拟短信验证码
+
+	// 转借高频异常冻结判定参数
+	RiskEventWindow       = 7 * 24 * time.Hour // 人脸不匹配事件观察窗口：一周
+	RiskMinFaceFails      = 3                  // 窗口内人脸不匹配次数基础阈值（单人年卡）
+	RiskMinDistinctGates  = 2                  // 跨入口（不同闸机）数量阈值
+	RiskAutoFreezeFails   = 4                  // 自动冻结：失败次数阈值
+	RiskAutoFreezeGates   = 3                  // 自动冻结：且跨入口数量阈值（不同入口多次不匹配）
+	RiskAutoFreezeManuals = 2                  // 自动冻结：或人工放行记录次数阈值（无需跨 3 入口）
+	RiskRestrictEntryRate = 0.5                // 确认转借：剩余权益保留比例
+	RiskWeeklyEntryLimit  = 2                  // 确认转借：每周最多入园次数
+	RiskDailyEntryLimit   = 1                  // 确认转借：每日最多入园次数
 )
 
 // 业务错误（handler 映射为 4xx）
@@ -80,6 +91,22 @@ func keyHighFreq(passID string) string          { return "hf:" + passID }
 func keyMultiLoc(passID string) string          { return "loc:" + passID }
 func keyManualReview(id string) string          { return "mreview:" + id }
 func keyVerifReview(verifID string) string      { return "verif:" + verifID + ":review" }
+
+// 转借风控冻结相关 key
+func keyRiskEvents(passID string) string         { return "risk:" + passID + ":events" }
+func keyRiskEvent(id string) string              { return "revent:" + id }
+func keyRiskEventVerif(verifID string) string    { return "revent:verif:" + verifID }
+func keyFreezeCase(id string) string             { return "fcase:" + id }
+func keyPassFCases(passID string) string         { return "pass:" + passID + ":fcases" }
+func keyFCaseList() string                       { return "fcase:list" }
+func keyUnfreeze(id string) string               { return "ureq:" + id }
+func keyPassUnfreeze(passID string) string       { return "pass:" + passID + ":ureqs" }
+func keyUnfreezeList() string                    { return "ureq:list" }
+func keyRestriction(passID string) string        { return "restrict:" + passID }
+func keyInPark(passID string) string             { return "inpark:" + passID }
+func keyPassAppeals(passID string) string        { return "pass:" + passID + ":appeals" }
+func keyRestrictDay(passID, date string) string  { return "rl:day:" + passID + ":" + date }
+func keyRestrictWeek(passID, week string) string { return "rl:week:" + passID + ":" + week }
 
 // ---------- 时间辅助 ----------
 func dateOf(t time.Time) string { return t.Format("2006-01-02") }

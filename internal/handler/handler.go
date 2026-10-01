@@ -3,14 +3,43 @@ package handler
 import (
 	"context"
 	"errors"
+	"strings"
 
 	"github.com/gofiber/fiber/v2"
 	"passgate/internal/model"
+	"passgate/internal/openapi"
 	"passgate/internal/service"
 )
 
+func hasSuffix(s, suffix string) bool { return strings.HasSuffix(s, suffix) }
+
 // Register 注册全部路由
 func Register(app *fiber.App, svc *service.Service) {
+	// ---- OpenAPI 3.x 规范与 Swagger UI（后端项目交付要求，静态资源内嵌可离线使用）----
+	app.Get("/openapi.yaml", func(c *fiber.Ctx) error {
+		c.Set("Cache-Control", "no-cache")
+		return c.Type("yaml", "utf-8").Send(openapi.SpecYAML())
+	})
+	app.Get("/docs", func(c *fiber.Ctx) error {
+		return c.Type("html", "utf-8").SendString(openapi.SwaggerUIHTML())
+	})
+	app.Get("/docs/:asset", func(c *fiber.Ctx) error {
+		name := c.Params("asset")
+		b := openapi.Asset(name)
+		if b == nil {
+			return fiber.NewError(fiber.StatusNotFound, "asset not found")
+		}
+		ct := "text/plain; charset=utf-8"
+		switch {
+		case hasSuffix(name, ".css"):
+			ct = "text/css; charset=utf-8"
+		case hasSuffix(name, ".js"):
+			ct = "application/javascript; charset=utf-8"
+		}
+		c.Set("Content-Type", ct)
+		return c.Send(b)
+	})
+
 	app.Get("/healthz", func(c *fiber.Ctx) error {
 		if err := svc.St.Ping(context.Background()); err != nil {
 			return c.Status(503).JSON(fiber.Map{"status": "redis_down"})
@@ -69,6 +98,33 @@ func Register(app *fiber.App, svc *service.Service) {
 		_ = c.BodyParser(&body)
 		p, err := svc.Unfreeze(ctx(), c.Params("id"), operator(c, body.Operator))
 		return respond(c, p, err)
+	})
+	api.Post("/passes/:id/risk-freeze", func(c *fiber.Ctx) error {
+		var body struct {
+			Operator string `json:"operator"`
+			Note     string `json:"note"`
+		}
+		if err := c.BodyParser(&body); err != nil || body.Note == "" {
+			return fail(ErrBadRequest)
+		}
+		fc, err := svc.ManualRiskFreeze(ctx(), c.Params("id"), operator(c, body.Operator), body.Note)
+		return respond(c, fc, err)
+	})
+	api.Get("/passes/:id/risk-snapshot", func(c *fiber.Ctx) error {
+		sn := svc.RiskSnapshotFor(ctx(), c.Params("id"))
+		return respond(c, fiber.Map{
+			"risk_snapshot":  sn,
+			"meets_auto":     sn.MeetsAutoFreeze(),
+			"meets_manual":   sn.MeetsManualFreeze(),
+			"holder_in_park": svc.IsHolderInPark(ctx(), c.Params("id")),
+		}, nil)
+	})
+	api.Get("/passes/:id/restriction", func(c *fiber.Ctx) error {
+		r, err := svc.GetRestriction(ctx(), c.Params("id"))
+		if err != nil {
+			return c.JSON(fiber.Map{"data": nil})
+		}
+		return c.JSON(fiber.Map{"data": r})
 	})
 	api.Post("/passes/:id/refund", func(c *fiber.Ctx) error {
 		var body struct {
@@ -271,6 +327,44 @@ func Register(app *fiber.App, svc *service.Service) {
 		}
 		a, err := svc.ResolveAppeal(ctx(), c.Params("id"), body.Approve, body.Resolution, body.CompensateQuota, body.Handler)
 		return respond(c, a, err)
+	})
+
+	// ---- 转借高频异常冻结 ----
+	api.Get("/freeze-cases", func(c *fiber.Ctx) error {
+		list, err := svc.ListFreezeCases(ctx(), c.Query("pass_id"), c.Query("status"))
+		return respond(c, list, err)
+	})
+	api.Get("/freeze-cases/:id", func(c *fiber.Ctx) error {
+		fc, err := svc.GetFreezeCase(ctx(), c.Params("id"))
+		return respond(c, fc, err)
+	})
+	api.Get("/freeze-cases/:id/material", func(c *fiber.Ctx) error {
+		m, err := svc.GetExplanationMaterial(ctx(), c.Params("id"))
+		return respond(c, m, err)
+	})
+	api.Post("/unfreeze-requests", func(c *fiber.Ctx) error {
+		var in service.UnfreezeInput
+		if err := c.BodyParser(&in); err != nil || in.PassID == "" {
+			return fail(ErrBadRequest)
+		}
+		u, err := svc.SubmitUnfreezeRequest(ctx(), in)
+		return respond(c, u, err)
+	})
+	api.Get("/unfreeze-requests", func(c *fiber.Ctx) error {
+		list, err := svc.ListUnfreezeRequests(ctx(), c.Query("pass_id"), c.Query("status"))
+		return respond(c, list, err)
+	})
+	api.Post("/unfreeze-requests/:id/review", func(c *fiber.Ctx) error {
+		var body struct {
+			Decision string `json:"decision"` // APPROVED | REJECTED | CONFIRM_LENDING
+			Note     string `json:"note"`
+			Handler  string `json:"handler"`
+		}
+		if err := c.BodyParser(&body); err != nil || body.Decision == "" {
+			return fail(ErrBadRequest)
+		}
+		u, err := svc.ReviewUnfreeze(ctx(), c.Params("id"), body.Decision, body.Note, operator(c, body.Handler))
+		return respond(c, u, err)
 	})
 
 	// ---- 基础数据 ----

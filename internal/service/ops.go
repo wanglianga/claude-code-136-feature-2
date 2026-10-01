@@ -155,6 +155,7 @@ func (s *Service) CreateAppeal(ctx context.Context, passID, verifID, typ, descri
 		return nil, err
 	}
 	s.St.R.LPush(ctx, keyAppealList(), id)
+	s.St.R.LPush(ctx, keyPassAppeals(passID), id)
 	return a, nil
 }
 
@@ -207,8 +208,22 @@ func (s *Service) ResolveAppeal(ctx context.Context, id string, approve bool, re
 				s.statIncr(ctx, "stats:quota:used:"+string(p.Type), -int64(compensateQuota))
 			}
 		}
+		// 申诉核实为本人（照片过时等）：对应人脸不匹配事件剔除出转借冻结判定
+		if a.VerificationID != "" {
+			s.SuppressRiskEvent(ctx, a.VerificationID, a.ID)
+		}
+		// 剔除后剩余证据不再达标的风控冻结自动解除
+		if s.MaybeUnfreezeAfterAppeal(ctx, a.PassID, a.ID) {
+			a.Resolution = resolution + "；相关风险事件剔除后证据不足，已自动解除临时冻结"
+		}
 	} else {
 		a.Status = "REJECTED"
+		// 持卡人申诉被驳回：按最新风险画像复评，证据达到门槛（≥3次不匹配/跨≥2入口）时立即临时冻结
+		if p, err := s.getPass(ctx, a.PassID); err == nil && p.Status == model.PassStatusActive {
+			if fc, ferr := s.EvaluateAfterAppealReject(ctx, a.PassID, a.ID); ferr == nil && fc != nil {
+				a.Resolution = resolution + fmt.Sprintf("；申诉驳回后风险复评触发临时冻结（案件 %s）", fc.ID)
+			}
+		}
 	}
 	if err := s.St.SetJSON(ctx, keyAppeal(id), &a); err != nil {
 		return nil, err
@@ -346,13 +361,15 @@ type TypeStats struct {
 
 // OverviewStats 运营总览
 type OverviewStats struct {
-	Date            string           `json:"date"`
-	EntriesTotal    int64            `json:"entries_total"`
-	AnomalyTotal    int64            `json:"anomaly_total"`
-	ManualReleases  int64            `json:"manual_releases"`
-	FrozenPasses    int64            `json:"frozen_passes"`
-	ByType          []TypeStats      `json:"by_type"`
-	AnomalyByReason map[string]int64 `json:"anomaly_by_reason"`
+	Date             string           `json:"date"`
+	EntriesTotal     int64            `json:"entries_total"`
+	AnomalyTotal     int64            `json:"anomaly_total"`
+	ManualReleases   int64            `json:"manual_releases"`
+	FrozenPasses     int64            `json:"frozen_passes"`
+	RiskFrozenPasses int64            `json:"risk_frozen_passes"`
+	LendingConfirmed int64            `json:"lending_confirmed_total"`
+	ByType           []TypeStats      `json:"by_type"`
+	AnomalyByReason  map[string]int64 `json:"anomaly_by_reason"`
 }
 
 func (s *Service) getInt64(ctx context.Context, key string) int64 {
@@ -369,6 +386,8 @@ func (s *Service) StatsOverview(ctx context.Context, date string) (*OverviewStat
 	o.AnomalyTotal = s.getInt64(ctx, "stats:anomaly:total:"+date)
 	o.ManualReleases = s.getInt64(ctx, "stats:manual:"+date)
 	o.FrozenPasses = s.getInt64(ctx, "stats:pass:frozen")
+	o.RiskFrozenPasses = s.getInt64(ctx, "stats:pass:risk_frozen")
+	o.LendingConfirmed = s.getInt64(ctx, "stats:lending:confirmed")
 	for _, t := range []model.PassType{model.PassTypeSingle, model.PassTypeParentChild, model.PassTypeFamily} {
 		ts := TypeStats{
 			PassType:       t,

@@ -151,6 +151,14 @@ func (s *Service) Verify(ctx context.Context, req VerifyRequest) (*VerifyResult,
 		return s.finish(ctx, v, p, model.DecisionManual, model.ReasonPassFrozen,
 			"年卡已冻结："+p.FreezeReason), nil
 	}
+	if p.Status == model.PassStatusRestricted {
+		// 转借高频异常冻结：仅限制新的入园动作；持卡人若已在园内，不追溯驱离
+		detail := fmt.Sprintf("年卡因转借高频异常临时冻结（案件 %s），冻结期间无法刷闸进入新的景点", p.FreezeCaseID)
+		if p.HolderInPark {
+			detail += "；您已在园区内，本次游玩不受影响、不会被要求离开"
+		}
+		return s.finish(ctx, v, p, model.DecisionManual, model.ReasonLendingRestricted, detail), nil
+	}
 	if date > p.ValidUntil {
 		return s.finish(ctx, v, p, model.DecisionQuota, model.ReasonPassExpired,
 			fmt.Sprintf("年卡已于 %s 到期", p.ValidUntil)), nil
@@ -244,8 +252,17 @@ func (s *Service) Verify(ctx context.Context, req VerifyRequest) (*VerifyResult,
 			"现场采集照片不清晰，无法完成人脸比对"), nil
 	}
 	if req.FaceScore < FacePassScore {
-		return s.finish(ctx, v, p, model.DecisionManual, model.ReasonFaceMismatch,
-			fmt.Sprintf("人脸比对得分 %.1f 低于阈值 %.0f", req.FaceScore, FacePassScore)), nil
+		res := s.finish(ctx, v, p, model.DecisionManual, model.ReasonFaceMismatch,
+			fmt.Sprintf("人脸比对得分 %.1f 低于阈值 %.0f", req.FaceScore, FacePassScore))
+		// 转借高频异常冻结：记录人脸不匹配事件，并按近 7 天画像自动评估是否临时冻结
+		if _, err := s.RecordRiskEvent(ctx, v); err == nil {
+			if fc, ferr := s.EvaluateAndMaybeFreeze(ctx, p.ID); ferr == nil && fc != nil {
+				v.Detail += fmt.Sprintf("；系统已据此触发转借高频异常临时冻结（案件 %s，在园不追溯驱离）", fc.ID)
+				_ = s.St.SetJSON(ctx, keyVerif(v.ID), v)
+				res = s.resultOf(ctx, v)
+			}
+		}
+		return res, nil
 	}
 
 	// 9) 放行去重快速路径：同一游客同一景点在去重窗口内已放行 → 视为同一次入园
@@ -276,6 +293,18 @@ func (s *Service) Verify(ctx context.Context, req VerifyRequest) (*VerifyResult,
 	if attr != nil {
 		capLimit = attr.Capacity
 	}
+	// 确认转借限制使用期：不可带同行人 + 每日/每周入园频次限制
+	var restriction *model.QuotaRestriction
+	if r, err := s.GetRestriction(ctx, p.ID); err == nil && r != nil {
+		restriction = r
+		if len(req.Companions) > r.CompanionsAllowed {
+			return s.finish(ctx, v, p, model.DecisionQuota, model.ReasonLendingUsageLimit,
+				"该年卡确认转借处于限制使用期，不可携带同行人入园"), nil
+		}
+		if msg := s.checkRestrictionEntry(ctx, r, ts); msg != "" {
+			return s.finish(ctx, v, p, model.DecisionQuota, model.ReasonLendingUsageLimit, msg), nil
+		}
+	}
 	code, charged, extra, err := s.runCharge(ctx, p.ID, req.Attraction, date, need, capLimit, verifID)
 	if err != nil {
 		return nil, err
@@ -285,19 +314,24 @@ func (s *Service) Verify(ctx context.Context, req VerifyRequest) (*VerifyResult,
 		v.ChargedQuota = int(charged)
 		s.recordEntryStats(ctx, date, ts.Hour(), p.Type, req.Attraction, v.ChargedQuota)
 		s.markReservationUsed(ctx, p.ID, req.Attraction, date)
+		s.markEntryInPark(ctx, p.ID)
 		return s.finish(ctx, v, p, model.DecisionAllow, model.ReasonNone,
 			fmt.Sprintf("核验通过，扣减权益 %d 人次", v.ChargedQuota)), nil
 	case 2: // 并发下去重标记已被写入（与快速路径竞争的兜底）
 		v.DuplicateOf = extra
+		s.releaseRestrictionEntry(ctx, restriction, ts) // 同次入园不重复占用限制频次
 		return s.finish(ctx, v, p, model.DecisionAllow, model.ReasonDuplicateEntry,
 			"并发重复核验，按首次放行处理，不重复扣减权益"), nil
 	case 4:
+		s.releaseRestrictionEntry(ctx, restriction, ts)
 		return s.finish(ctx, v, p, model.DecisionQuota, model.ReasonQuotaExhausted,
 			fmt.Sprintf("剩余权益不足：需 %d 人次", need)), nil
 	case 5:
+		s.releaseRestrictionEntry(ctx, restriction, ts)
 		return s.finish(ctx, v, p, model.DecisionManual, model.ReasonCapacityFull,
 			"景点当前在园人数已达容量上限，请现场疏导"), nil
 	default:
+		s.releaseRestrictionEntry(ctx, restriction, ts)
 		return s.finish(ctx, v, p, model.DecisionQuota, model.ReasonQuotaExhausted, "权益额度记录异常"), nil
 	}
 }
@@ -438,8 +472,34 @@ func (s *Service) ManualReview(ctx context.Context, verifID string, in ManualRev
 		if v.PassID == "" {
 			return nil, fmt.Errorf("%w: cannot release without pass", ErrInvalidInput)
 		}
+		p, perr := s.getPass(ctx, v.PassID)
+		if perr != nil {
+			return nil, perr
+		}
+		// 转借风控冻结期间：限制新的入园动作，任何人工放行一律拒绝（在园不驱离但不能新入园）
+		if p.Status == model.PassStatusRestricted {
+			return nil, fmt.Errorf("%w: 年卡处于转借风控冻结（案件 %s），冻结期间不支持人工放行入园",
+				ErrPassNotActive, p.FreezeCaseID)
+		}
+		// 确认转借限制使用期：人脸不匹配不再支持人工放行，且不可带同行人
+		var restriction *model.QuotaRestriction
+		if r, err := s.GetRestriction(ctx, v.PassID); err == nil && r != nil {
+			restriction = r
+			if r.ManualEntryBlocked && v.Reason == model.ReasonFaceMismatch {
+				return nil, fmt.Errorf("%w: 该年卡确认转借处于限制使用期，人脸不匹配不再支持人工放行，须本人刷脸",
+					ErrPassNotActive)
+			}
+			if len(v.Companions) > r.CompanionsAllowed {
+				return nil, fmt.Errorf("%w: 限制使用期不可携带同行人", ErrPassNotActive)
+			}
+		}
 		need := 1 + len(v.Companions)
 		date := dateOf(v.CreatedAt)
+		if restriction != nil {
+			if msg := s.checkRestrictionEntry(ctx, restriction, v.CreatedAt); msg != "" {
+				return nil, fmt.Errorf("%w: %s", ErrQuotaInsufficient, msg)
+			}
+		}
 		code, charged, _, err := s.runCharge(ctx, v.PassID, v.Attraction, date, need, 0, verifID)
 		if err != nil {
 			return nil, err
@@ -447,19 +507,28 @@ func (s *Service) ManualReview(ctx context.Context, verifID string, in ManualRev
 		switch code {
 		case 1:
 			mr.ChargedQuota = int(charged)
+			s.markEntryInPark(ctx, v.PassID)
 		case 2:
 			mr.ChargedQuota = 0 // 去重窗口内已扣过，不重复扣
+			s.releaseRestrictionEntry(ctx, restriction, v.CreatedAt)
 		default:
+			s.releaseRestrictionEntry(ctx, restriction, v.CreatedAt)
 			return nil, ErrQuotaInsufficient
 		}
 		v.ManualAction = "RELEASED"
 		v.Detail += fmt.Sprintf("；人工放行 by %s：%s", in.Operator, in.Note)
-		p, _ := s.getPass(ctx, v.PassID)
 		if p != nil {
 			s.recordEntryStats(ctx, date, v.CreatedAt.Hour(), p.Type, v.Attraction, mr.ChargedQuota)
 		}
 		s.statIncr(ctx, "stats:manual:"+date, 1)
 		s.writeGateLog(ctx, v, "MANUAL_RELEASE", in.Operator)
+		// 人脸不匹配被人工放行：记为转借加权信号，并立即复评是否触发风控冻结
+		if v.Reason == model.ReasonFaceMismatch {
+			s.MarkRiskEventManualRelease(ctx, verifID)
+			if fc, ferr := s.EvaluateAndMaybeFreeze(ctx, v.PassID); ferr == nil && fc != nil {
+				v.Detail += fmt.Sprintf("；系统据此触发转借高频异常临时冻结（案件 %s）", fc.ID)
+			}
+		}
 	} else {
 		v.ManualAction = "REJECTED"
 		v.Detail += fmt.Sprintf("；人工拒绝 by %s：%s", in.Operator, in.Note)
@@ -513,6 +582,7 @@ return 1`)
 	_ = s.St.SetJSON(ctx, keyGateLog(id), &gl)
 	s.St.R.LPush(ctx, keyGateLogList(), id)
 	s.St.R.LPush(ctx, keyPassGateLogs(req.PassID), id)
+	s.clearInPark(ctx, req.PassID)
 	return nil
 }
 

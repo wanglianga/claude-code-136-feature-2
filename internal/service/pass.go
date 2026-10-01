@@ -199,8 +199,21 @@ func (s *Service) Freeze(ctx context.Context, id, reason, operator string) (*mod
 	return p, nil
 }
 
-// Unfreeze 解冻：恢复 active，已预约订单继续有效
+// Unfreeze 解冻：恢复 active，已预约订单继续有效。
+// 转借风控冻结（restricted）走风控解冻路径，待核验预约一并恢复。
 func (s *Service) Unfreeze(ctx context.Context, id, operator string) (*model.Pass, error) {
+	p, err := s.getPass(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if p.Status == model.PassStatusRestricted {
+		if err := s.clearRiskFreeze(ctx, id, model.FreezeCaseUnfrozen, operator,
+			"客服直接解除转借风控冻结，恢复全部权益"); err != nil {
+			return nil, err
+		}
+		return s.getPass(ctx, id)
+	}
+
 	token, ok, err := s.St.Lock(ctx, "pass:"+id, 5*time.Second)
 	if err != nil {
 		return nil, err
@@ -210,7 +223,7 @@ func (s *Service) Unfreeze(ctx context.Context, id, operator string) (*model.Pas
 	}
 	defer s.St.Unlock(ctx, "pass:"+id, token)
 
-	p, err := s.getPass(ctx, id)
+	p, err = s.getPass(ctx, id)
 	if err != nil {
 		return nil, err
 	}
@@ -257,20 +270,31 @@ func (s *Service) Refund(ctx context.Context, id, operator string) (*model.Pass,
 		remainDays = 0
 	}
 	refund := math.Round(p.PaidAmount*float64(remainDays)/float64(totalDays)*RefundRate*100) / 100
+	wasRiskFrozen := p.Status == model.PassStatusRestricted
 	now := time.Now()
 	p.Status = model.PassStatusRefunded
 	p.RefundedAt = &now
 	p.RefundAmount = refund
+	p.FreezeReason = ""
+	p.FrozenAt = nil
+	if wasRiskFrozen {
+		p.FreezeCaseID = ""
+		p.HolderInPark = false
+	}
 	if err := s.savePass(ctx, p); err != nil {
 		return nil, err
 	}
+	if wasRiskFrozen {
+		s.statIncr(ctx, "stats:pass:risk_frozen", -1)
+	}
 	// 权益清零
 	s.St.R.Set(ctx, keyRemaining(id), 0, 0)
-	// 未使用预约取消
+	// 未使用预约取消（含风控冻结转待核验的预约）
 	rsvIDs, _ := s.St.R.SMembers(ctx, keyPassRsv(id)).Result()
 	for _, rid := range rsvIDs {
 		var r model.Reservation
-		if err := s.St.GetJSON(ctx, keyReservation(rid), &r); err == nil && r.Status == "BOOKED" {
+		if err := s.St.GetJSON(ctx, keyReservation(rid), &r); err == nil &&
+			(r.Status == "BOOKED" || r.Status == model.ReservationPendingVerify) {
 			r.Status = "CANCELLED"
 			_ = s.St.SetJSON(ctx, keyReservation(rid), &r)
 		}

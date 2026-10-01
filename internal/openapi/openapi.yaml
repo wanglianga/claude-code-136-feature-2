@@ -1,0 +1,1009 @@
+openapi: 3.0.3
+info:
+  title: passgate 景区年卡实名入园同行权益与异常核验服务
+  version: 1.1.0
+  description: >
+    景区年卡核验后端 API。覆盖年卡生命周期、闸机入园核验（人脸/证件/二维码/同行人/
+    时段/容量）、疑似转借高频/多地异常、人工放行留痕、转借高频异常冻结与解冻申请、
+    确认转借权益限制、预约、申诉、退款/升级重算与运营统计。
+
+
+    演示环境不设登录鉴权，操作人通过请求头 `X-Operator: <姓名>` 或请求体 `operator`
+    字段标识。
+servers:
+  - url: http://127.0.0.1:8080
+    description: 本地
+tags:
+  - name: pass
+    description: 年卡生命周期
+  - name: verify
+    description: 闸机核验与人工处理
+  - name: risk
+    description: 转借高频异常冻结 / 解冻申请 / 权益限制
+  - name: device
+    description: 闸机设备
+  - name: reservation
+    description: 预约
+  - name: appeal
+    description: 客服申诉
+  - name: base
+    description: 景点 / 节假日
+  - name: admin
+    description: 运营售卖规则与统计
+paths:
+  /healthz:
+    get:
+      tags: [base]
+      summary: 健康检查
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: {type: string, example: ok}
+  /api/passes:
+    post:
+      tags: [pass]
+      summary: 购卡（实名+人脸+证件+手机号+成员；一证一卡，按售卖规则快照发卡）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreatePassInput"
+      responses:
+        "200":
+          description: 年卡详情
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PassViewEnvelope"
+        "409":
+          $ref: "#/components/responses/Conflict"
+    get:
+      tags: [pass]
+      summary: 按手机号查卡
+      parameters:
+        - {name: phone, in: query, required: true, schema: {type: string}}
+      responses:
+        "200":
+          description: 年卡列表
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: {$ref: "#/components/schemas/PassView"}
+  /api/passes/{id}:
+    get:
+      tags: [pass]
+      summary: 年卡详情（实时剩余额度、成员、二维码 token）
+      parameters:
+        - {$ref: "#/components/parameters/PassId"}
+      responses:
+        "200":
+          description: 年卡详情
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/PassViewEnvelope"}
+        "404": {$ref: "#/components/responses/NotFound"}
+  /api/passes/{id}/freeze:
+    post:
+      tags: [pass]
+      summary: 普通冻结（挂失等，不影响已预约未入园订单）
+      parameters: [{$ref: "#/components/parameters/PassId"}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason]
+              properties:
+                reason: {type: string}
+                operator: {type: string}
+      responses:
+        "200": {description: OK}
+        "409": {$ref: "#/components/responses/Conflict"}
+  /api/passes/{id}/unfreeze:
+    post:
+      tags: [pass]
+      summary: 解冻（普通冻结或转借风控冻结均可用；风控冻结时待核验预约恢复）
+      parameters: [{$ref: "#/components/parameters/PassId"}]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                operator: {type: string}
+      responses:
+        "200": {description: OK}
+        "409": {$ref: "#/components/responses/Conflict"}
+  /api/passes/{id}/risk-freeze:
+    post:
+      tags: [risk]
+      summary: 客服人工转借风控冻结（需近7天≥3次不匹配且跨≥2入口，或存在人工放行/申诉争议）
+      parameters: [{$ref: "#/components/parameters/PassId"}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [note]
+              properties:
+                note: {type: string, description: 冻结说明}
+                operator: {type: string}
+      responses:
+        "200":
+          description: 冻结案件
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: {$ref: "#/components/schemas/FreezeCase"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "409": {$ref: "#/components/responses/Conflict"}
+  /api/passes/{id}/risk-snapshot:
+    get:
+      tags: [risk]
+      summary: 近 7 天转借风险画像（失败次数/入口数/人工放行/申诉，及是否达标）
+      parameters: [{$ref: "#/components/parameters/PassId"}]
+      responses:
+        "200":
+          description: 风险画像
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      risk_snapshot: {$ref: "#/components/schemas/RiskSnapshot"}
+                      meets_auto: {type: boolean}
+                      meets_manual: {type: boolean}
+                      holder_in_park: {type: boolean}
+  /api/passes/{id}/restriction:
+    get:
+      tags: [risk]
+      summary: 查询确认转借后的权益限制规则（无则 data=null）
+      parameters: [{$ref: "#/components/parameters/PassId"}]
+      responses:
+        "200":
+          description: 限制规则
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: {$ref: "#/components/schemas/QuotaRestriction"}
+  /api/passes/{id}/refund:
+    post:
+      tags: [pass]
+      summary: 退款（按剩余有效期×80%折算，权益清零，未用预约取消）
+      parameters: [{$ref: "#/components/parameters/PassId"}]
+      responses:
+        "200": {description: OK}
+        "409": {$ref: "#/components/responses/Conflict"}
+  /api/passes/{id}/upgrade:
+    post:
+      tags: [pass]
+      summary: 升级（补差价，有效期与额度按新卡重新计算）
+      parameters: [{$ref: "#/components/parameters/PassId"}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [to_type]
+              properties:
+                to_type: {$ref: "#/components/schemas/PassType"}
+                operator: {type: string}
+      responses:
+        "200": {description: OK}
+  /api/passes/{id}/phone:
+    post:
+      tags: [pass]
+      summary: 换绑手机号（演示验证码固定 123456）
+      parameters: [{$ref: "#/components/parameters/PassId"}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                old_phone: {type: string}
+                new_phone: {type: string}
+                code: {type: string, example: "123456"}
+                operator: {type: string}
+      responses:
+        "200": {description: OK}
+        "403": {$ref: "#/components/responses/Forbidden"}
+  /api/passes/{id}/members:
+    post:
+      tags: [pass]
+      summary: 添加同行成员（消耗成员更换次数）
+      parameters: [{$ref: "#/components/parameters/PassId"}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - {$ref: "#/components/schemas/MemberInput"}
+                - type: object
+                  properties:
+                    operator: {type: string}
+      responses:
+        "200": {description: OK}
+        "409": {$ref: "#/components/responses/Conflict"}
+  /api/passes/{id}/members/{mid}:
+    delete:
+      tags: [pass]
+      summary: 移除同行成员
+      parameters: [{$ref: "#/components/parameters/PassId"}, {$ref: "#/components/parameters/MemberId"}]
+      responses:
+        "200": {description: OK}
+        "404": {$ref: "#/components/responses/NotFound"}
+  /api/passes/{id}/members/{mid}/photo:
+    post:
+      tags: [pass]
+      summary: 更新成员人脸照片（版本+1）
+      parameters: [{$ref: "#/components/parameters/PassId"}, {$ref: "#/components/parameters/MemberId"}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [photo_url]
+              properties:
+                photo_url: {type: string}
+                operator: {type: string}
+      responses:
+        "200": {description: OK}
+  /api/passes/{id}/members/{mid}/face-exempt:
+    post:
+      tags: [pass]
+      summary: 设置/取消成员免刷脸标记（老人等）
+      parameters: [{$ref: "#/components/parameters/PassId"}, {$ref: "#/components/parameters/MemberId"}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                exempt: {type: boolean}
+                operator: {type: string}
+      responses:
+        "200": {description: OK}
+  /api/passes/{id}/qr-refresh:
+    post:
+      tags: [pass]
+      summary: 刷新入园二维码（旧码立即失效）
+      parameters: [{$ref: "#/components/parameters/PassId"}]
+      responses:
+        "200": {description: OK}
+  /api/passes/{id}/changes:
+    get:
+      tags: [pass]
+      summary: 年卡变更日志（冻结/解冻/确认转借等敏感操作均留痕）
+      parameters: [{$ref: "#/components/parameters/PassId"}]
+      responses:
+        "200": {description: OK}
+  /api/passes/{id}/verifications:
+    get:
+      tags: [verify]
+      summary: 年卡核验历史
+      parameters: [{$ref: "#/components/parameters/PassId"}]
+      responses:
+        "200": {description: OK}
+  /api/passes/{id}/reservations:
+    get:
+      tags: [reservation]
+      summary: 年卡预约列表
+      parameters: [{$ref: "#/components/parameters/PassId"}]
+      responses:
+        "200": {description: OK}
+  /api/passes/{id}/gate-logs:
+    get:
+      tags: [verify]
+      summary: 年卡闸机流水
+      parameters: [{$ref: "#/components/parameters/PassId"}]
+      responses:
+        "200": {description: OK}
+  /api/verify:
+    post:
+      tags: [verify]
+      summary: >
+        闸机核验，返回 ALLOW / MANUAL_REVIEW / QUOTA_INSUFFICIENT / SUSPECTED_LENDING
+        及原因码。人脸不匹配会记录风险事件并按近 7 天画像自动评估转借风控冻结。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/VerifyRequest"}
+      responses:
+        "200":
+          description: 核验结论
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: {$ref: "#/components/schemas/VerifyResult"}
+  /api/verifications/{id}:
+    get:
+      tags: [verify]
+      summary: 核验详情（失败原因 + 人工处理链路，客服可解释）
+      parameters: [{$ref: "#/components/parameters/VerificationId"}]
+      responses:
+        "200": {description: OK}
+        "404": {$ref: "#/components/responses/NotFound"}
+  /api/verifications/{id}/manual-review:
+    post:
+      tags: [verify]
+      summary: >
+        现场人工放行/拒绝（必须填操作人与说明）。风控冻结期间一律拒绝放行；
+        确认转借限制期人脸不匹配也不再支持人工放行。
+      parameters: [{$ref: "#/components/parameters/VerificationId"}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/ManualReviewInput"}
+      responses:
+        "200": {description: OK}
+        "409": {$ref: "#/components/responses/Conflict"}
+  /api/exit:
+    post:
+      tags: [verify]
+      summary: 出园，释放在园容量并清除在园标记
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [pass_id, attraction]
+              properties:
+                pass_id: {type: string}
+                attraction: {type: string}
+                count: {type: integer, default: 1}
+                device_id: {type: string}
+      responses:
+        "200": {description: OK}
+  /api/freeze-cases:
+    get:
+      tags: [risk]
+      summary: 转借风控冻结案件列表
+      parameters:
+        - {name: pass_id, in: query, schema: {type: string}}
+        - {name: status, in: query, schema: {type: string, enum: [FROZEN, UNFROZEN, RESTRICTED]}}
+      responses:
+        "200":
+          description: 案件列表
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: {$ref: "#/components/schemas/FreezeCase"}
+  /api/freeze-cases/{id}:
+    get:
+      tags: [risk]
+      summary: 冻结案件详情
+      parameters: [{$ref: "#/components/parameters/CaseId"}]
+      responses:
+        "200":
+          description: 案件
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: {$ref: "#/components/schemas/FreezeCase"}
+        "404": {$ref: "#/components/responses/NotFound"}
+  /api/freeze-cases/{id}/material:
+    get:
+      tags: [risk]
+      summary: 客服解释材料（判定依据、证据链、现场话术、权益限制说明）
+      parameters: [{$ref: "#/components/parameters/CaseId"}]
+      responses:
+        "200":
+          description: 解释材料
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: {$ref: "#/components/schemas/ExplanationMaterial"}
+        "404": {$ref: "#/components/responses/NotFound"}
+  /api/unfreeze-requests:
+    post:
+      tags: [risk]
+      summary: 游客提交解冻申请（证件 + 近期照片）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/UnfreezeInput"}
+      responses:
+        "200":
+          description: 解冻申请
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: {$ref: "#/components/schemas/UnfreezeRequest"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "409": {$ref: "#/components/responses/Conflict"}
+    get:
+      tags: [risk]
+      summary: 解冻申请列表
+      parameters:
+        - {name: pass_id, in: query, schema: {type: string}}
+        - {name: status, in: query, schema: {type: string, enum: [PENDING, APPROVED, REJECTED, CONFIRM_LENDING]}}
+      responses:
+        "200":
+          description: 申请列表
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: {$ref: "#/components/schemas/UnfreezeRequest"}
+  /api/unfreeze-requests/{id}/review:
+    post:
+      tags: [risk]
+      summary: >
+        客服审核解冻申请。APPROVE 恢复全部权益（待核验预约恢复）；
+        REJECTED 驳回维持冻结；CONFIRM_LENDING 确认转借，剩余权益按限制规则使用。
+      parameters: [{$ref: "#/components/parameters/UnfreezeId"}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [decision, note]
+              properties:
+                decision: {type: string, enum: [APPROVED, REJECTED, CONFIRM_LENDING]}
+                note: {type: string}
+                handler: {type: string}
+      responses:
+        "200":
+          description: 审核结果
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: {$ref: "#/components/schemas/UnfreezeRequest"}
+        "409": {$ref: "#/components/responses/Conflict"}
+  /api/devices:
+    post:
+      tags: [device]
+      summary: 注册闸机设备
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/Device"}
+      responses:
+        "200": {description: OK}
+    get:
+      tags: [device]
+      summary: 设备列表（含在线状态）
+      responses:
+        "200": {description: OK}
+  /api/devices/{id}/heartbeat:
+    post:
+      tags: [device]
+      summary: 设备心跳
+      parameters: [{$ref: "#/components/parameters/DeviceId"}]
+      responses:
+        "200": {description: OK}
+        "404": {$ref: "#/components/responses/NotFound"}
+  /api/reservations:
+    post:
+      tags: [reservation]
+      summary: 预约（冻结/风控冻结卡不可新预约）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [pass_id, attraction, date]
+              properties:
+                pass_id: {type: string}
+                attraction: {type: string}
+                date: {type: string, example: "2026-10-02"}
+                slot: {type: string}
+      responses:
+        "200": {description: OK}
+        "409": {$ref: "#/components/responses/Conflict"}
+  /api/reservations/{id}/cancel:
+    post:
+      tags: [reservation]
+      summary: 取消预约
+      parameters: [{$ref: "#/components/parameters/ReservationId"}]
+      responses:
+        "200": {description: OK}
+        "409": {$ref: "#/components/responses/Conflict"}
+  /api/appeals:
+    post:
+      tags: [appeal]
+      summary: >
+        游客申诉。核实为本人时对应人脸不匹配事件剔除出冻结判定，证据不足自动解冻；
+        驳回则按最新画像复评是否临时冻结。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [pass_id, description]
+              properties:
+                pass_id: {type: string}
+                verification_id: {type: string}
+                type: {type: string, enum: [WRONG_DEDUCTION, VERIFY_FAIL, FREEZE_DISPUTE, OTHER]}
+                description: {type: string}
+      responses:
+        "200": {description: OK}
+    get:
+      tags: [appeal]
+      summary: 申诉列表
+      parameters:
+        - {name: status, in: query, schema: {type: string, enum: [PENDING, APPROVED, REJECTED]}}
+      responses:
+        "200": {description: OK}
+  /api/appeals/{id}/resolve:
+    post:
+      tags: [appeal]
+      summary: 客服处理申诉（通过自动返还误扣额度）
+      parameters: [{$ref: "#/components/parameters/AppealId"}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [resolution]
+              properties:
+                approve: {type: boolean}
+                resolution: {type: string}
+                compensate_quota: {type: integer}
+                handler: {type: string}
+      responses:
+        "200": {description: OK}
+        "409": {$ref: "#/components/responses/Conflict"}
+  /api/attractions:
+    get:
+      tags: [base]
+      summary: 景点列表
+      responses:
+        "200": {description: OK}
+    post:
+      tags: [base]
+      summary: 创建景点
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/Attraction"}
+      responses:
+        "200": {description: OK}
+  /api/attractions/{id}/capacity:
+    get:
+      tags: [base]
+      summary: 景点当前在园人数
+      parameters:
+        - {$ref: "#/components/parameters/AttractionId"}
+        - {name: date, in: query, schema: {type: string}}
+      responses:
+        "200": {description: OK}
+  /api/holidays:
+    get:
+      tags: [base]
+      summary: 节假日配置
+      responses:
+        "200": {description: OK}
+    put:
+      tags: [base]
+      summary: 全量设置节假日
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                dates: {type: array, items: {type: string}}
+                operator: {type: string}
+      responses:
+        "200": {description: OK}
+  /api/admin/sales-rules:
+    get:
+      tags: [admin]
+      summary: 售卖规则列表
+      responses:
+        "200": {description: OK}
+  /api/admin/sales-rules/{type}:
+    put:
+      tags: [admin]
+      summary: 调整售卖规则（仅影响新售卡）
+      parameters:
+        - name: type
+          in: path
+          required: true
+          schema: {$ref: "#/components/schemas/PassType"}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/SalesRule"}
+      responses:
+        "200": {description: OK}
+  /api/admin/stats/overview:
+    get:
+      tags: [admin]
+      summary: 运营总览（含 risk_frozen_passes / lending_confirmed_total）
+      parameters:
+        - {name: date, in: query, schema: {type: string}}
+      responses:
+        "200": {description: OK}
+  /api/admin/stats/peaks:
+    get:
+      tags: [admin]
+      summary: 入园峰值（按小时/景点）
+      parameters:
+        - {name: date, in: query, schema: {type: string}}
+      responses:
+        "200": {description: OK}
+  /api/admin/gate-logs:
+    get:
+      tags: [admin]
+      summary: 全量闸机流水
+      parameters:
+        - {name: limit, in: query, schema: {type: integer, default: 100}}
+      responses:
+        "200": {description: OK}
+components:
+  parameters:
+    PassId:
+      name: id
+      in: path
+      required: true
+      schema: {type: string}
+    MemberId:
+      name: mid
+      in: path
+      required: true
+      schema: {type: string}
+    VerificationId:
+      name: id
+      in: path
+      required: true
+      schema: {type: string}
+    CaseId:
+      name: id
+      in: path
+      required: true
+      schema: {type: string}
+    UnfreezeId:
+      name: id
+      in: path
+      required: true
+      schema: {type: string}
+    DeviceId:
+      name: id
+      in: path
+      required: true
+      schema: {type: string}
+    ReservationId:
+      name: id
+      in: path
+      required: true
+      schema: {type: string}
+    AppealId:
+      name: id
+      in: path
+      required: true
+      schema: {type: string}
+    AttractionId:
+      name: id
+      in: path
+      required: true
+      schema: {type: string}
+  responses:
+    BadRequest:
+      description: 请求参数错误
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/Error"}
+    NotFound:
+      description: 资源不存在
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/Error"}
+    Conflict:
+      description: 状态冲突
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/Error"}
+    Forbidden:
+      description: 禁止（如短信验证码错误）
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/Error"}
+  schemas:
+    PassType:
+      type: string
+      enum: [single, family, parent_child]
+    Error:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            message: {type: string}
+    MemberInput:
+      type: object
+      properties:
+        name: {type: string}
+        id_card: {type: string}
+        id_card_expiry: {type: string, example: "2032-01-01"}
+        relation: {type: string, enum: [self, spouse, child, parent, other]}
+        photo_url: {type: string}
+        face_exempt: {type: boolean}
+    CreatePassInput:
+      type: object
+      required: [type, holder_name, holder_id_card, id_card_expiry, phone]
+      properties:
+        type: {$ref: "#/components/schemas/PassType"}
+        holder_name: {type: string}
+        holder_id_card: {type: string}
+        id_card_expiry: {type: string}
+        phone: {type: string}
+        photo_url: {type: string}
+        members:
+          type: array
+          items: {$ref: "#/components/schemas/MemberInput"}
+    Member:
+      type: object
+      properties:
+        id: {type: string}
+        pass_id: {type: string}
+        name: {type: string}
+        id_card: {type: string}
+        id_card_expiry: {type: string}
+        role: {type: string, enum: [holder, companion]}
+        relation: {type: string}
+        photo_url: {type: string}
+        photo_version: {type: integer}
+        face_exempt: {type: boolean}
+    Pass:
+      type: object
+      properties:
+        id: {type: string}
+        type: {$ref: "#/components/schemas/PassType"}
+        status: {type: string, enum: [active, frozen, restricted, refunded]}
+        holder_name: {type: string}
+        holder_id_card: {type: string}
+        phone: {type: string}
+        valid_from: {type: string}
+        valid_until: {type: string}
+        total_quota: {type: integer}
+        companion_limit: {type: integer}
+        attractions: {type: array, items: {type: string}}
+        holiday_blocked: {type: boolean}
+        allowed_slots: {type: array, items: {type: string}}
+        member_change_left: {type: integer}
+        paid_amount: {type: number}
+        freeze_reason: {type: string, enum: [MANUAL, RISK_AUTO, RISK_MANUAL, ""]}
+        freeze_case_id: {type: string}
+        holder_in_park: {type: boolean}
+    PassView:
+      allOf:
+        - {$ref: "#/components/schemas/Pass"}
+        - type: object
+          properties:
+            remaining_quota: {type: integer}
+            used_quota: {type: integer}
+            members:
+              type: array
+              items: {$ref: "#/components/schemas/Member"}
+            qr_token: {type: string}
+    PassViewEnvelope:
+      type: object
+      properties:
+        data: {$ref: "#/components/schemas/PassView"}
+    VerifyRequest:
+      type: object
+      required: [request_id, device_id, attraction]
+      properties:
+        request_id: {type: string, description: 闸机幂等键，重试保持不变}
+        device_id: {type: string}
+        pass_id: {type: string}
+        qr_token: {type: string}
+        id_card: {type: string}
+        face_score: {type: number, description: 0-100；-1 未采集到人脸}
+        photo_clear: {type: boolean}
+        companions: {type: array, items: {type: string}}
+        attraction: {type: string}
+        timestamp: {type: string, format: date-time}
+        offline_sync: {type: boolean}
+    VerifyResult:
+      type: object
+      properties:
+        verification_id: {type: string}
+        decision:
+          type: string
+          enum: [ALLOW, MANUAL_REVIEW, QUOTA_INSUFFICIENT, SUSPECTED_LENDING]
+        reason:
+          type: string
+          description: >
+            DEVICE_UNKNOWN / DEVICE_OFFLINE / PASS_NOT_FOUND / PASS_FROZEN /
+            LENDING_RESTRICTED / LENDING_USAGE_LIMITED / PASS_REFUNDED / PASS_EXPIRED /
+            PASS_NOT_STARTED / ATTRACTION_NOT_ALLOWED / HOLIDAY_BLOCKED /
+            TIMESLOT_BLOCKED / CAPACITY_FULL / COMPANION_EXCEEDED / COMPANION_NOT_BOUND /
+            FACE_MISMATCH / FACE_EXEMPT_REVIEW / PHOTO_UNCLEAR / ID_EXPIRED /
+            HIGH_FREQUENCY / MULTI_LOCATION / QUOTA_EXHAUSTED / DUPLICATE_ENTRY
+        detail: {type: string}
+        charged_quota: {type: integer}
+        remaining_quota: {type: integer}
+        duplicate_of: {type: string}
+    ManualReviewInput:
+      type: object
+      required: [action, operator, note]
+      properties:
+        action: {type: string, enum: [RELEASE, REJECT]}
+        operator: {type: string}
+        note: {type: string}
+    RiskEvent:
+      type: object
+      properties:
+        id: {type: string}
+        pass_id: {type: string}
+        verification_id: {type: string}
+        device_id: {type: string}
+        gate_id: {type: string}
+        attraction: {type: string}
+        face_score: {type: number}
+        occurred_at: {type: string, format: date-time}
+        suppressed_by: {type: string}
+        manual_release: {type: boolean}
+    RiskSnapshot:
+      type: object
+      properties:
+        events:
+          type: array
+          items: {$ref: "#/components/schemas/RiskEvent"}
+        fail_count: {type: integer}
+        gate_count: {type: integer}
+        gates: {type: array, items: {type: string}}
+        manual_count: {type: integer}
+        appeal_count: {type: integer}
+    FreezeCase:
+      type: object
+      properties:
+        id: {type: string}
+        pass_id: {type: string}
+        trigger: {type: string, enum: [AUTO, MANUAL]}
+        reason: {type: string, enum: [RISK_AUTO, RISK_MANUAL]}
+        status: {type: string, enum: [FROZEN, UNFROZEN, RESTRICTED]}
+        operator: {type: string}
+        summary: {type: string}
+        event_ids: {type: array, items: {type: string}}
+        fail_count: {type: integer}
+        gate_count: {type: integer}
+        manual_count: {type: integer}
+        appeal_count: {type: integer}
+        holder_in_park: {type: boolean}
+        script: {type: string}
+        created_at: {type: string, format: date-time}
+        resolved_at: {type: string, format: date-time, nullable: true}
+    UnfreezeInput:
+      type: object
+      required: [pass_id, id_doc_url, photo_url]
+      properties:
+        pass_id: {type: string}
+        id_doc_url: {type: string, description: 证件材料 URL}
+        photo_url: {type: string, description: 近期照片 URL}
+        statement: {type: string}
+    UnfreezeRequest:
+      type: object
+      properties:
+        id: {type: string}
+        pass_id: {type: string}
+        freeze_case_id: {type: string}
+        id_doc_url: {type: string}
+        photo_url: {type: string}
+        statement: {type: string}
+        status: {type: string, enum: [PENDING, APPROVED, REJECTED, CONFIRM_LENDING]}
+        review_note: {type: string}
+        handler: {type: string}
+        created_at: {type: string, format: date-time}
+        reviewed_at: {type: string, format: date-time, nullable: true}
+    QuotaRestriction:
+      type: object
+      properties:
+        pass_id: {type: string}
+        freeze_case_id: {type: string}
+        entry_quota_left: {type: integer, description: 剩余可入园次数（原剩余的 50%）}
+        companions_allowed: {type: integer, description: 同行人数上限（0）}
+        weekly_entry_limit: {type: integer}
+        daily_entry_limit: {type: integer}
+        manual_entry_blocked: {type: boolean, description: 人脸不匹配禁止人工放行}
+        reason: {type: string}
+        operator: {type: string}
+        created_at: {type: string, format: date-time}
+    ExplanationMaterial:
+      type: object
+      properties:
+        case: {$ref: "#/components/schemas/FreezeCase"}
+        pass_id: {type: string}
+        holder_name: {type: string}
+        pass_type: {type: string}
+        phone: {type: string}
+        evidence:
+          type: array
+          items:
+            type: object
+            properties:
+              event_id: {type: string}
+              occurred_at: {type: string, format: date-time}
+              gate_id: {type: string}
+              device_id: {type: string}
+              attraction: {type: string}
+              face_score: {type: number}
+              manual_release: {type: boolean}
+              verification_id: {type: string}
+        on_site_script: {type: string}
+        restriction: {$ref: "#/components/schemas/QuotaRestriction"}
+        restriction_note: {type: string}
+    Device:
+      type: object
+      properties:
+        id: {type: string}
+        name: {type: string}
+        gate_id: {type: string}
+        attraction: {type: string}
+    Attraction:
+      type: object
+      properties:
+        id: {type: string}
+        name: {type: string}
+        capacity: {type: integer}
+    SalesRule:
+      type: object
+      properties:
+        pass_type: {$ref: "#/components/schemas/PassType"}
+        price: {type: number}
+        total_quota: {type: integer}
+        companion_limit: {type: integer}
+        attractions: {type: array, items: {type: string}}
+        holiday_blocked: {type: boolean}
+        allowed_slots: {type: array, items: {type: string}}
+        valid_days: {type: integer}
+        member_change_limit: {type: integer}
+        on_sale: {type: boolean}
+        daily_limit: {type: integer}

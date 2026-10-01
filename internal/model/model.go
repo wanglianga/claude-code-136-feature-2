@@ -15,9 +15,17 @@ const (
 type PassStatus string
 
 const (
-	PassStatusActive   PassStatus = "active"
-	PassStatusFrozen   PassStatus = "frozen"
-	PassStatusRefunded PassStatus = "refunded"
+	PassStatusActive     PassStatus = "active"
+	PassStatusFrozen     PassStatus = "frozen"     // 普通冻结（挂失/人工冻结）
+	PassStatusRestricted PassStatus = "restricted" // 转借风控冻结：限制新入园，在园不驱离
+	PassStatusRefunded   PassStatus = "refunded"
+)
+
+// 冻结原因（FreezeReason）
+const (
+	FreezeReasonManual     = "MANUAL"      // 客服人工冻结
+	FreezeReasonRiskAuto   = "RISK_AUTO"   // 高频人脸不匹配自动风控冻结
+	FreezeReasonRiskManual = "RISK_MANUAL" // 客服根据风险事件人工风控冻结
 )
 
 // Decision 核验结论
@@ -53,7 +61,9 @@ const (
 	ReasonHighFrequency     = "HIGH_FREQUENCY"
 	ReasonMultiLocation     = "MULTI_LOCATION"
 	ReasonQuotaExhausted    = "QUOTA_EXHAUSTED"
-	ReasonDuplicateEntry    = "DUPLICATE_ENTRY" // 网络抖动重复请求，视为同一次入园
+	ReasonDuplicateEntry    = "DUPLICATE_ENTRY"       // 网络抖动重复请求，视为同一次入园
+	ReasonLendingRestricted = "LENDING_RESTRICTED"    // 转借风控冻结期间，限制新入园动作
+	ReasonLendingUsageLimit = "LENDING_USAGE_LIMITED" // 确认转借后，剩余权益按限制规则使用（频次/同行受限）
 )
 
 // Member 年卡成员（持卡人 + 同行成员）
@@ -90,6 +100,8 @@ type Pass struct {
 	PaidAmount       float64    `json:"paid_amount"`
 	FreezeReason     string     `json:"freeze_reason,omitempty"`
 	FrozenAt         *time.Time `json:"frozen_at,omitempty"`
+	FreezeCaseID     string     `json:"freeze_case_id,omitempty"` // 转借风控冻结案件 ID
+	HolderInPark     bool       `json:"holder_in_park,omitempty"` // 风控冻结时持卡人是否已在园区（不追溯驱离）
 	RefundedAt       *time.Time `json:"refunded_at,omitempty"`
 	RefundAmount     float64    `json:"refund_amount,omitempty"`
 	UpgradedFrom     string     `json:"upgraded_from,omitempty"`
@@ -173,9 +185,17 @@ type Reservation struct {
 	Attraction string    `json:"attraction"`
 	Date       string    `json:"date"` // YYYY-MM-DD
 	Slot       string    `json:"slot"`
-	Status     string    `json:"status"` // BOOKED | USED | CANCELLED
+	Status     string    `json:"status"` // BOOKED | USED | CANCELLED | PENDING_VERIFY
 	CreatedAt  time.Time `json:"created_at"`
 }
+
+// 预约状态
+const (
+	ReservationBooked        = "BOOKED"
+	ReservationUsed          = "USED"
+	ReservationCancelled     = "CANCELLED"
+	ReservationPendingVerify = "PENDING_VERIFY" // 风控冻结：已预约订单进入待核验
+)
 
 // Appeal 客服申诉单
 type Appeal struct {
@@ -224,4 +244,83 @@ type ChangeLog struct {
 	Detail    string    `json:"detail"`
 	Operator  string    `json:"operator"`
 	CreatedAt time.Time `json:"created_at"`
+}
+
+// RiskEvent 人脸不匹配风险事件（一周内按卡聚合，作为转借高频异常冻结的判定依据）
+type RiskEvent struct {
+	ID             string    `json:"id"`
+	PassID         string    `json:"pass_id"`
+	VerificationID string    `json:"verification_id"`
+	DeviceID       string    `json:"device_id"`
+	GateID         string    `json:"gate_id"`
+	Attraction     string    `json:"attraction"`
+	FaceScore      float64   `json:"face_score"`
+	OccurredAt     time.Time `json:"occurred_at"`
+	// SuppressedBy 若该次不匹配后来被持卡人申诉核实为本人（照片过时等），记录申诉单 ID 并不再计入判定
+	SuppressedBy string `json:"suppressed_by,omitempty"`
+	// ManualRelease 该次不匹配是否曾被现场人工放行（放行记录是"实际使用人可能与持卡人不一致"的加权信号）
+	ManualRelease bool `json:"manual_release"`
+}
+
+// FreezeCase 转借高频异常冻结案件（自动触发或客服人工发起）
+type FreezeCase struct {
+	ID           string     `json:"id"`
+	PassID       string     `json:"pass_id"`
+	Trigger      string     `json:"trigger"` // AUTO | MANUAL
+	Reason       string     `json:"reason"`  // RISK_AUTO | RISK_MANUAL
+	Status       string     `json:"status"`  // FROZEN | UNFROZEN | RESTRICTED
+	Operator     string     `json:"operator,omitempty"`
+	Summary      string     `json:"summary"` // 判定依据摘要（失败次数/入口数/人工放行/申诉）
+	EventIDs     []string   `json:"event_ids"`
+	FailCount    int        `json:"fail_count"`
+	GateCount    int        `json:"gate_count"`
+	ManualCount  int        `json:"manual_count"`
+	AppealCount  int        `json:"appeal_count"`
+	HolderInPark bool       `json:"holder_in_park"` // 冻结时持卡人是否在园（不追溯驱离）
+	Script       string     `json:"script"`         // 现场解释话术
+	CreatedAt    time.Time  `json:"created_at"`
+	ResolvedAt   *time.Time `json:"resolved_at,omitempty"`
+}
+
+// 冻结案件状态
+const (
+	FreezeCaseFrozen     = "FROZEN"     // 风控冻结中
+	FreezeCaseUnfrozen   = "UNFROZEN"   // 申诉成立/解冻申请通过，已恢复
+	FreezeCaseRestricted = "RESTRICTED" // 确认转借，权益限制使用
+)
+
+// UnfreezeRequest 解冻申请：游客提交证件与近期照片
+type UnfreezeRequest struct {
+	ID           string     `json:"id"`
+	PassID       string     `json:"pass_id"`
+	FreezeCaseID string     `json:"freeze_case_id"`
+	IDDocURL     string     `json:"id_doc_url"` // 证件材料
+	PhotoURL     string     `json:"photo_url"`  // 近期照片
+	Statement    string     `json:"statement"`  // 情况说明
+	Status       string     `json:"status"`     // PENDING | APPROVED | REJECTED
+	ReviewNote   string     `json:"review_note,omitempty"`
+	Handler      string     `json:"handler,omitempty"`
+	CreatedAt    time.Time  `json:"created_at"`
+	ReviewedAt   *time.Time `json:"reviewed_at,omitempty"`
+}
+
+// 解冻申请状态
+const (
+	UnfreezePending  = "PENDING"
+	UnfreezeApproved = "APPROVED"
+	UnfreezeRejected = "REJECTED"
+)
+
+// QuotaRestriction 确认转借后的权益限制规则快照
+type QuotaRestriction struct {
+	PassID             string    `json:"pass_id"`
+	FreezeCaseID       string    `json:"freeze_case_id"`
+	EntryQuotaLeft     int       `json:"entry_quota_left"`     // 剩余可入园次数（总剩余的一定比例）
+	CompanionsAllowed  int       `json:"companions_allowed"`   // 同行人数上限（降为 0）
+	WeeklyEntryLimit   int       `json:"weekly_entry_limit"`   // 每周入园次数上限
+	DailyEntryLimit    int       `json:"daily_entry_limit"`    // 每日入园次数上限（必须本人刷脸，不允许人工放行）
+	ManualEntryBlocked bool      `json:"manual_entry_blocked"` // 人脸不匹配时禁止人工放行
+	Reason             string    `json:"reason"`
+	Operator           string    `json:"operator"`
+	CreatedAt          time.Time `json:"created_at"`
 }
