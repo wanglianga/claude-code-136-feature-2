@@ -167,6 +167,77 @@ func Register(app *fiber.App, svc *service.Service) {
 		return respond(c, list, err)
 	})
 
+	// ---- 转借高频异常冻结 ----
+	api.Get("/risk/freeze-cases", func(c *fiber.Ctx) error {
+		list, err := svc.ListFreezeCases(ctx(), c.Query("status"))
+		return respond(c, list, err)
+	})
+	api.Get("/risk/freeze-cases/:id", func(c *fiber.Ctx) error {
+		fc, events, apps, err := svc.GetFreezeCase(ctx(), c.Params("id"))
+		if err != nil {
+			return respond(c, nil, err)
+		}
+		return c.JSON(fiber.Map{
+			"data": fc, "face_risk_events": events, "unfreeze_applications": apps,
+			"explanation": svc.BuildCSExplanation(ctx(), fc, events),
+		})
+	})
+	api.Post("/risk/freeze-cases/:id/confirm-lending", func(c *fiber.Ctx) error {
+		var body struct {
+			Note    string `json:"note"`
+			Handler string `json:"handler"`
+		}
+		if err := c.BodyParser(&body); err != nil {
+			return fail(ErrBadRequest)
+		}
+		if body.Handler == "" {
+			body.Handler = operator(c, "")
+		}
+		p, fc, err := svc.ConfirmLending(ctx(), c.Params("id"), body.Note, body.Handler)
+		if err != nil {
+			return respond(c, nil, err)
+		}
+		return c.JSON(fiber.Map{"data": p, "case": fc})
+	})
+	api.Get("/passes/:id/freeze-cases", func(c *fiber.Ctx) error {
+		list, err := svc.ListPassFreezeCases(ctx(), c.Params("id"))
+		return respond(c, list, err)
+	})
+	api.Post("/passes/:id/unfreeze-application", func(c *fiber.Ctx) error {
+		var body struct {
+			IDDocURL    string `json:"id_doc_url"`
+			RecentPhoto string `json:"recent_photo"`
+			Statement   string `json:"statement"`
+		}
+		if err := c.BodyParser(&body); err != nil {
+			return fail(ErrBadRequest)
+		}
+		a, err := svc.SubmitUnfreezeApplication(ctx(), c.Params("id"), body.IDDocURL, body.RecentPhoto, body.Statement)
+		return respond(c, a, err)
+	})
+	api.Get("/unfreeze-applications", func(c *fiber.Ctx) error {
+		list, err := svc.ListUnfreezeApplications(ctx(), c.Query("status"))
+		return respond(c, list, err)
+	})
+	api.Post("/unfreeze-applications/:id/review", func(c *fiber.Ctx) error {
+		var body struct {
+			Approve bool   `json:"approve"`
+			Note    string `json:"note"`
+			Handler string `json:"handler"`
+		}
+		if err := c.BodyParser(&body); err != nil {
+			return fail(ErrBadRequest)
+		}
+		if body.Handler == "" {
+			body.Handler = operator(c, "")
+		}
+		a, p, err := svc.ReviewUnfreezeApplication(ctx(), c.Params("id"), body.Approve, body.Note, body.Handler)
+		if err != nil {
+			return respond(c, nil, err)
+		}
+		return c.JSON(fiber.Map{"data": a, "pass": p})
+	})
+
 	// ---- 核验 ----
 	api.Post("/verify", func(c *fiber.Ctx) error {
 		var req service.VerifyRequest
@@ -368,7 +439,7 @@ func ErrorHandler(c *fiber.Ctx, err error) error {
 		return c.Status(code).JSON(fiber.Map{"error": fiber.Map{"message": msg}})
 	}
 	switch {
-	case errors.Is(err, service.ErrNotFound):
+	case errors.Is(err, service.ErrNotFound), errors.Is(err, service.ErrCaseNotFound), errors.Is(err, service.ErrAppNotFound):
 		code = fiber.StatusNotFound
 	case errors.Is(err, service.ErrInvalidInput), errors.Is(err, ErrBadRequest):
 		code = fiber.StatusBadRequest
@@ -378,7 +449,10 @@ func ErrorHandler(c *fiber.Ctx, err error) error {
 		errors.Is(err, service.ErrAlreadyProcessed),
 		errors.Is(err, service.ErrDuplicateHolder),
 		errors.Is(err, service.ErrMemberChangeNone),
-		errors.Is(err, service.ErrQuotaInsufficient):
+		errors.Is(err, service.ErrQuotaInsufficient),
+		errors.Is(err, service.ErrAppPending),
+		errors.Is(err, service.ErrRestricted),
+		errors.Is(err, service.ErrDailyEntryLimit):
 		code = fiber.StatusConflict
 	case errors.Is(err, service.ErrOffSale), errors.Is(err, service.ErrDailyLimit):
 		code = fiber.StatusConflict

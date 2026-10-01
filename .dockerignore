@@ -1,0 +1,7 @@
+passgate
+*.log
+.git
+.gitignore
+.idea
+.vscode
+tmp

@@ -145,6 +145,20 @@ st, r = req("GET", "/api/admin/sales-rules")
 check("售卖规则 3 类", st == 200 and len(r["data"]) == 3)
 st, r = req("GET", "/api/holidays")
 check("2026 节假日已配置", st == 200 and "2026-10-01" in r["data"])
+# 若测试当天恰为配置中的节假日（如在 2026-10-01 当天跑测试），临时移除当日配置，
+# 使依赖“今天可正常入园”的用例与运行日期无关；节假日专项用例改用另一个节假日日期。
+_today = local_date()
+if _today in r["data"]:
+    _adjusted = [d for d in r["data"] if d != _today]
+    st2, _ = req("PUT", "/api/holidays", {"dates": _adjusted, "operator": "test-runner"})
+    check("测试当天为节假日：临时移除当日节假日配置", st2 == 200)
+
+def a_holiday_date():
+    st, h = req("GET", "/api/holidays")
+    for d in h["data"]:
+        if d != local_date():
+            return d
+    return "2026-01-01"
 
 section("B. 购卡与售卖规则")
 p1 = buy_pass("single")
@@ -248,7 +262,7 @@ st, r = verify(pass_id=pcard["id"], attraction="attr-summit", ts=local_ts(10, 30
 check("景点不适用 ATTRACTION_NOT_ALLOWED", r["data"]["reason"] == "ATTRACTION_NOT_ALLOWED", r)
 
 psingle = buy_pass("single")  # 单人卡节假日不可用
-st, r = verify(pass_id=psingle["id"], ts=local_ts(10, 30, date="2026-10-01"))
+st, r = verify(pass_id=psingle["id"], ts=local_ts(10, 30, date=a_holiday_date()))
 check("节假日限制 HOLIDAY_BLOCKED", r["data"]["reason"] == "HOLIDAY_BLOCKED", r)
 st, r = verify(pass_id=psingle["id"], ts=local_ts(23, 30))
 check("时段限制 TIMESLOT_BLOCKED", r["data"]["reason"] == "TIMESLOT_BLOCKED", r)
@@ -454,6 +468,225 @@ st, r = req("GET", f"/api/passes/{pm['id']}/changes")
 check("变更日志留痕", st == 200 and any(c["action"] == "CREATE" for c in r["data"]), r)
 st, r = req("GET", "/api/appeals?status=APPROVED")
 check("申诉列表查询", st == 200 and len(r["data"]) >= 1, r)
+
+section("M. 转借高频异常冻结（自动冻结/解冻申请/在园不驱离/确认转借）")
+
+def face_fail(pass_id, device, attraction, tag):
+    return verify(pass_id=pass_id, device=device, attraction=attraction, face=20.0, req_id=f"RISK-{tag}")
+
+# M1. 一周内 3 个入口 3 次人脸不匹配 → 自动冻结；预约转待核验；申诉计入证据
+prisk = buy_pass("single")
+st, r = req("POST", "/api/reservations", {"pass_id": prisk["id"], "attraction": "attr-lake",
+                                          "date": local_date(), "slot": "10:00-12:00"})
+check("风控场景：预先预约成功", st == 200 and r["data"]["status"] == "BOOKED", r)
+st, r = req("POST", "/api/appeals", {"pass_id": prisk["id"], "type": "FREEZE_DISPUTE",
+                                     "description": "本人脸受伤近期容貌变化，不是转借"})
+check("风控场景：冻结前持卡人申诉", st == 200, r)
+st, r = face_fail(prisk["id"], "dev-east-01", "attr-lake", "M1-1")
+check("不匹配第1次：不冻结", r["data"]["reason"] == "FACE_MISMATCH" and "auto_freeze_case_id" not in r["data"], r)
+st, r = face_fail(prisk["id"], "dev-west-01", "attr-summit", "M1-2")
+check("不匹配第2次：仍不冻结", r["data"]["reason"] == "FACE_MISMATCH" and "auto_freeze_case_id" not in r["data"], r)
+st, r = face_fail(prisk["id"], "dev-south-01", "attr-garden", "M1-3")
+case_id = r["data"].get("auto_freeze_case_id")
+check("不匹配第3次(跨3入口)：触发自动冻结", r["data"]["reason"] == "FACE_MISMATCH" and case_id, r)
+st, r = req("GET", f"/api/passes/{prisk['id']}")
+pv = r["data"]
+check("卡状态=risk_auto 冻结", pv["status"] == "frozen" and pv["freeze_source"] == "risk_auto"
+      and pv["freeze_case_id"] == case_id, r["data"])
+check("待核验预约数=1", pv["pending_verification_count"] == 1, r["data"])
+st, r = req("GET", f"/api/passes/{prisk['id']}/reservations")
+check("已预约订单转待核验 PENDING_VERIFICATION",
+      r["data"][0]["attraction"] == "attr-lake" and r["data"][0]["status"] == "PENDING_VERIFICATION", r)
+
+# M2. 案件证据与客服解释材料
+st, r = req("GET", f"/api/risk/freeze-cases/{case_id}")
+fc, evs, apps, expl = r["data"], r["face_risk_events"], r["unfreeze_applications"], r["explanation"]
+check("案件：3 次不匹配/3 个入口/1 次申诉",
+      fc["status"] == "FROZEN" and fc["fail_count"] == 3 and fc["gate_count"] == 3
+      and fc["appeals"] == 1 and fc["holder_in_park"] is False and len(evs) == 3, r)
+check("案件：客服解释材料与现场话术(不在园版本)",
+      "人脸不匹配" in expl["evidence"] and "解冻" in expl["customer_say"]
+      and "本次无法入园" in expl["onsite_say"] and "不会要求您离开" not in expl["onsite_say"], r)
+st, r = req("GET", "/api/risk/freeze-cases?status=FROZEN")
+check("冻结案件列表可按状态过滤", any(c["id"] == case_id for c in r["data"]), r)
+st, r = req("GET", f"/api/passes/{prisk['id']}/changes")
+check("变更日志留痕 RISK_FREEZE", any(c["action"] == "RISK_FREEZE" for c in r["data"]), r)
+
+# M3. 冻结只限制新的入园动作，人工放行也被阻断
+st, r = verify(pass_id=prisk["id"], device="dev-east-01", attraction="attr-lake",
+               face=95.0, req_id="RISK-M1-BLOCKED")
+blocked_vid = r["data"]["verification_id"]
+check("冻结卡刷闸 PASS_FROZEN",
+      r["data"]["decision"] == "MANUAL_REVIEW" and r["data"]["reason"] == "PASS_FROZEN"
+      and "在园区内" not in r["data"]["detail"], r)
+st, r = req("POST", f"/api/verifications/{blocked_vid}/manual-review",
+            {"action": "RELEASE", "operator": "staff-chen", "note": "想强行放行"})
+check("冻结卡禁止人工放行新入园", st == 409, r)
+st, r = req("POST", "/api/reservations", {"pass_id": prisk["id"], "attraction": "attr-summit",
+                                          "date": local_date(), "slot": "14:00-16:00"})
+check("冻结期间不可新预约", st == 409, r)
+
+# M4. 解冻申请：缺材料 400；重复待审 409；驳回后可再次申请
+st, r = req("POST", f"/api/passes/{prisk['id']}/unfreeze-application",
+            {"id_doc_url": "", "recent_photo": "", "statement": "材料忘带"})
+check("解冻申请缺证件/照片被拒", st == 400, r)
+st, r = req("POST", f"/api/passes/{prisk['id']}/unfreeze-application",
+            {"id_doc_url": "https://img.example.com/id.jpg",
+             "recent_photo": "https://img.example.com/recent.jpg", "statement": "是本人，近期受伤消肿后变样"})
+app_id = r["data"]["id"]
+check("解冻申请提交成功(PENDING)", st == 200 and r["data"]["status"] == "PENDING", r)
+st, r = req("POST", f"/api/passes/{prisk['id']}/unfreeze-application",
+            {"id_doc_url": "https://img.example.com/id.jpg", "recent_photo": "https://img.example.com/recent.jpg"})
+check("同一案件重复待审申请被拒", st == 409, r)
+st, r = req("GET", "/api/unfreeze-applications?status=PENDING")
+check("解冻申请列表", any(a["id"] == app_id for a in r["data"]), r)
+st, r = req("POST", f"/api/unfreeze-applications/{app_id}/review",
+            {"approve": False, "note": "照片模糊无法比对，请重新提交", "handler": "cs-wang"})
+check("解冻申请驳回", st == 200 and r["data"]["status"] == "REJECTED", r)
+st, r = req("GET", f"/api/passes/{prisk['id']}")
+check("驳回后卡仍冻结", r["data"]["status"] == "frozen", r)
+st, r = req("POST", f"/api/passes/{prisk['id']}/unfreeze-application",
+            {"id_doc_url": "https://img.example.com/id2.jpg",
+             "recent_photo": "https://img.example.com/recent2.jpg", "statement": "重新拍了清晰照片"})
+app_id2 = r["data"]["id"]
+check("驳回后可再次提交申请", st == 200 and r["data"]["status"] == "PENDING", r)
+st, r = req("POST", f"/api/unfreeze-applications/{app_id2}/review",
+            {"approve": True, "note": "证件与近期照片比对一致，确为本人，解冻", "handler": "cs-wang"})
+check("解冻申请通过：卡恢复 active", st == 200 and r["pass"]["status"] == "active", r)
+st, r = req("GET", f"/api/risk/freeze-cases/{case_id}")
+check("案件结案 UNFROZEN", r["data"]["status"] == "UNFROZEN" and r["data"]["resolver"] == "cs-wang", r)
+st, r = verify(pass_id=prisk["id"], device="dev-east-01", attraction="attr-lake",
+               face=95.0, req_id="RISK-M1-UNFROZEN")
+check("解冻后正常放行", r["data"]["decision"] == "ALLOW" and r["data"]["charged_quota"] == 1, r)
+st, r = req("GET", f"/api/passes/{prisk['id']}/reservations")
+check("解冻入园后待核验预约补核销为 USED",
+      any(x["attraction"] == "attr-lake" and x["status"] == "USED" for x in r["data"]), r)
+
+# M5. 在园持卡人触发冻结：不追溯驱离，现场话术不同
+pinpark = buy_pass("single")
+st, r = verify(pass_id=pinpark["id"], device="dev-east-01", attraction="attr-lake",
+               face=95.0, req_id="RISK-M5-IN")
+check("在园场景：先正常入园", r["data"]["decision"] == "ALLOW", r)
+st, r = req("GET", f"/api/passes/{pinpark['id']}")
+check("在园标记 in_park=true", r["data"]["in_park"] is True, r)
+face_fail(pinpark["id"], "dev-east-01", "attr-lake", "M5-1")
+face_fail(pinpark["id"], "dev-west-01", "attr-summit", "M5-2")
+st, r = face_fail(pinpark["id"], "dev-south-01", "attr-garden", "M5-3")
+inpark_case = r["data"].get("auto_freeze_case_id")
+check("在园期间触发自动冻结", bool(inpark_case), r)
+st, r = req("GET", f"/api/risk/freeze-cases/{inpark_case}")
+check("案件记录冻结时在园 holder_in_park=true", r["data"]["holder_in_park"] is True, r)
+check("现场话术：已在园不驱离+限制新入园",
+      "不会要求您离开" in r["explanation"]["onsite_say"] and "新的入园" in r["explanation"]["onsite_say"], r)
+st, r = verify(pass_id=pinpark["id"], device="dev-west-01", attraction="attr-summit",
+               face=95.0, req_id="RISK-M5-BLOCKED")
+check("冻结后新入园被拦且提示在园不驱离",
+      r["data"]["reason"] == "PASS_FROZEN" and "不追溯驱离" in r["data"]["detail"], r)
+st, r = req("POST", "/api/exit", {"pass_id": pinpark["id"], "attraction": "attr-lake",
+                                  "count": 1, "device_id": "dev-east-01"})
+st, r = req("GET", f"/api/passes/{pinpark['id']}")
+check("出园后在园标记清除", st == 200 and r["data"]["in_park"] is False, r)
+
+# M6. 人工放行记录计入冻结证据
+pmanual = buy_pass("single")
+st, r = req("POST", "/api/reservations", {"pass_id": pmanual["id"], "attraction": "attr-garden",
+                                          "date": local_date(), "slot": "14:00-16:00"})
+check("证据场景：百花园预约成功", st == 200 and r["data"]["status"] == "BOOKED", r)
+st, r = face_fail(pmanual["id"], "dev-east-01", "attr-lake", "M6-1")
+vid = r["data"]["verification_id"]
+st, r = req("POST", f"/api/verifications/{vid}/manual-review",
+            {"action": "RELEASE", "operator": "staff-chen", "note": "称卡主本人，人工放行"})
+check("证据场景：第1次不匹配人工放行", st == 200 and r["data"]["charged_quota"] == 1, r)
+st, r = face_fail(pmanual["id"], "dev-west-01", "attr-summit", "M6-2")
+vid = r["data"]["verification_id"]
+req("POST", f"/api/verifications/{vid}/manual-review",
+    {"action": "RELEASE", "operator": "staff-chen", "note": "又解释为本人，放行"})
+st, r = face_fail(pmanual["id"], "dev-south-01", "attr-garden", "M6-3")
+manual_case = r["data"].get("auto_freeze_case_id")
+st, cr = req("GET", f"/api/risk/freeze-cases/{manual_case}")
+check("案件含 2 次人工放行记录", st == 200 and cr["data"]["manual_releases"] == 2, cr)
+
+# M7. 确认转借 → 受限：每日 1 次本人入园、不可同行、不可预约、待核验预约取消
+st, r = req("POST", f"/api/risk/freeze-cases/{manual_case}/confirm-lending", {"note": ""})
+check("确认转借缺少说明被拒", st == 400, r)
+# 清掉 M6 人工放行写入的 90 秒放行去重标记，避免干扰限制期每日次数判断
+_dkeys = redis_cli("--scan", "--pattern", f"dedup:{pmanual['id']}:*").split()
+if _dkeys:
+    redis_cli("DEL", *_dkeys)
+st, r = req("POST", f"/api/risk/freeze-cases/{manual_case}/confirm-lending",
+            {"note": "现场承认将卡借予同事使用，证据确凿", "handler": "cs-wang"})
+check("确认转借：卡转 restricted", st == 200 and r["data"]["status"] == "restricted"
+      and r["data"]["restricted_daily_quota"] == 1, r)
+st, r = req("GET", f"/api/passes/{pmanual['id']}/reservations")
+check("确认转借：待核验预约被取消",
+      any(x["attraction"] == "attr-garden" and x["status"] == "CANCELLED" for x in r["data"]), r)
+st, r = req("GET", f"/api/risk/freeze-cases/{manual_case}")
+check("案件状态 LENDING_CONFIRMED", r["data"]["status"] == "LENDING_CONFIRMED", r)
+st, r = req("POST", "/api/reservations", {"pass_id": pmanual["id"], "attraction": "attr-lake",
+                                          "date": local_date(), "slot": "10:00-12:00"})
+check("受限卡不可新预约", st == 409, r)
+st, r = verify(pass_id=pmanual["id"], device="dev-east-01", attraction="attr-lake",
+               face=95.0, companions=["ID_NOT_BOUND_1"], req_id="RISK-M7-COMP")
+check("受限卡携同行被拦 PASS_RESTRICTED", r["data"]["reason"] == "PASS_RESTRICTED", r)
+st, r = verify(pass_id=pmanual["id"], device="dev-south-01", attraction="attr-garden",
+               face=95.0, req_id="RISK-M7-OK1")
+check("受限卡本人当日首次入园放行", r["data"]["decision"] == "ALLOW" and r["data"]["charged_quota"] == 1, r)
+st, r = verify(pass_id=pmanual["id"], device="dev-west-01", attraction="attr-summit",
+               face=95.0, req_id="RISK-M7-OK2")
+check("受限卡当日第二次入园被拦 PASS_RESTRICTED",
+      r["data"]["decision"] == "MANUAL_REVIEW" and r["data"]["reason"] == "PASS_RESTRICTED", r)
+st, r = req("POST", f"/api/verifications/{r['data']['verification_id']}/manual-review",
+            {"action": "RELEASE", "operator": "staff-chen", "note": "想再放一次"})
+check("受限卡超限人工放行被拒", st == 409, r)
+st, r = req("GET", f"/api/passes/{pmanual['id']}/changes")
+check("变更日志留痕 LENDING_CONFIRMED", any(c["action"] == "LENDING_CONFIRMED" for c in r["data"]), r)
+
+# M8. 反例：次数不足 / 单一入口不触发冻结
+pno = buy_pass("single")
+face_fail(pno["id"], "dev-east-01", "attr-lake", "M8-1")
+st, r = face_fail(pno["id"], "dev-west-01", "attr-summit", "M8-2")
+check("反例：2 次不匹配不冻结", "auto_freeze_case_id" not in r["data"], r)
+st, r = req("GET", f"/api/passes/{pno['id']}")
+check("反例：卡仍 active", r["data"]["status"] == "active", r)
+psame = buy_pass("single")
+face_fail(psame["id"], "dev-east-01", "attr-lake", "M8-3")
+face_fail(psame["id"], "dev-east-02", "attr-lake", "M8-4")
+st, r = face_fail(psame["id"], "dev-east-01", "attr-lake", "M8-5")
+check("反例：3 次不匹配但同一入口(同景点)不冻结", "auto_freeze_case_id" not in r["data"], r)
+st, r = req("GET", f"/api/passes/{psame['id']}")
+check("反例：卡仍 active(2)", r["data"]["status"] == "active", r)
+
+# M9. 人工冻结（非风控）不允许提交解冻申请，走人工解冻
+pman = buy_pass("single")
+req("POST", f"/api/passes/{pman['id']}/freeze", {"reason": "失主挂失", "operator": "cs-wang"})
+st, r = req("POST", f"/api/passes/{pman['id']}/unfreeze-application",
+            {"id_doc_url": "https://img.example.com/id.jpg", "recent_photo": "https://img.example.com/r.jpg"})
+check("人工冻结无风控案件，不走线上解冻申请", st == 409, r)
+st, r = req("POST", f"/api/passes/{pman['id']}/unfreeze", {"operator": "cs-wang"})
+check("人工解冻恢复", st == 200 and r["data"]["status"] == "active", r)
+
+section("N. OpenAPI 3.x 文档与 Swagger UI")
+import urllib.request as _u
+spec = _u.urlopen(BASE + "/openapi.yaml", timeout=10).read().decode()
+check("OpenAPI 规范可访问且版本 3.x、含风控接口",
+      spec.startswith("openapi: 3.0") and "/api/risk/freeze-cases" in spec
+      and "/api/passes/{id}/unfreeze-application" in spec)
+page = _u.urlopen(BASE + "/static/swagger-ui/index.html", timeout=10).read().decode()
+check("Swagger UI 页面本地化可访问", "swagger-ui-bundle.js" in page)
+js = _u.urlopen(BASE + "/static/vendor/swagger-ui-bundle.js", timeout=10).status
+check("Swagger UI 资源随服务提供", js == 200)
+# /docs 会 302 重定向到 Swagger UI（禁止自动跟随以断言重定向）
+import urllib.request as _u2
+class _NoRedirect(_u2.HTTPRedirectHandler):
+    def redirect_request(self, *a, **k):
+        return None
+_opnr = _u2.build_opener(_NoRedirect())
+try:
+    _opnr.open(BASE + "/docs", timeout=10)
+    _docs_code = 200
+except urllib.error.HTTPError as _e:
+    _docs_code = _e.code
+check("/docs 重定向到 Swagger UI", _docs_code in (301, 302), _docs_code)
 
 print(f"\n========================================")
 print(f"RESULT: PASS={PASS} FAIL={FAIL}")

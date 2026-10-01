@@ -21,6 +21,13 @@ const (
 	DeviceOfflineAfter = 60 * time.Second // 设备心跳超时判定离线
 	RefundRate         = 0.8              // 退款折算系数
 	VerifyCodeMock     = "123456"         // 演示环境模拟短信验证码
+
+	// 转借高频异常冻结参数
+	FaceRiskWindowDays     = 7 // 人脸不匹配风险统计窗口：一周
+	FaceRiskFreezeMinFails = 3 // 窗口内不同入口多次不匹配：至少 3 次
+	FaceRiskFreezeMinGates = 2 // 且出现在至少 2 个入口
+	// 确认转借后的权益限制
+	RestrictedDailyQuota = 1 // 每日仅可本人入园 1 人次（不可带同行人、不可新预约）
 )
 
 // 业务错误（handler 映射为 4xx）
@@ -37,6 +44,11 @@ var (
 	ErrOffSale           = errors.New("pass type is off sale")
 	ErrDailyLimit        = errors.New("daily sales limit reached")
 	ErrQuotaInsufficient = errors.New("remaining quota insufficient")
+	ErrCaseNotFound      = errors.New("freeze case not found")
+	ErrAppPending        = errors.New("unfreeze application already pending")
+	ErrAppNotFound       = errors.New("unfreeze application not found")
+	ErrRestricted        = errors.New("pass is restricted for confirmed lending")
+	ErrDailyEntryLimit   = errors.New("restricted daily entry limit reached")
 )
 
 // Service 业务服务
@@ -47,39 +59,49 @@ type Service struct {
 func New(st *store.Store) *Service { return &Service{St: st} }
 
 // ---------- Redis key 约定 ----------
-func keyPass(id string) string                  { return "pass:" + id }
-func keyMember(id string) string                { return "member:" + id }
-func keyPassMembers(id string) string           { return "pass:" + id + ":members" }
-func keyRemaining(id string) string             { return "pass:" + id + ":remaining" }
-func keyUsed(id string) string                  { return "pass:" + id + ":used" }
-func keyQRToken(id string) string               { return "pass:" + id + ":qrtoken" }
-func keyIdxHolder(idCard string) string         { return "idx:holder:idcard:" + idCard }
-func keyIdxMember(idCard string) string         { return "idx:member:idcard:" + idCard }
-func keyIdxPhone(phone string) string           { return "idx:phone:" + phone }
-func keyIdxQR(token string) string              { return "idx:qrtoken:" + token }
-func keyVerif(id string) string                 { return "verif:" + id }
-func keyVerifReq(reqID string) string           { return "verif:req:" + reqID }
-func keyPassVerifs(id string) string            { return "pass:" + id + ":verifs" }
-func keyGateLog(id string) string               { return "glog:" + id }
-func keyGateLogList() string                    { return "glog:list" }
-func keyPassGateLogs(id string) string          { return "pass:" + id + ":glogs" }
-func keyDevice(id string) string                { return "device:" + id }
-func keyDeviceList() string                     { return "device:list" }
-func keyReservation(id string) string           { return "rsv:" + id }
-func keyPassRsv(id string) string               { return "pass:" + id + ":rsv" }
-func keyAppeal(id string) string                { return "appeal:" + id }
-func keyAppealList() string                     { return "appeal:list" }
-func keyPassChanges(id string) string           { return "pass:" + id + ":changes" }
-func keyAttraction(id string) string            { return "attraction:" + id }
-func keyAttractionList() string                 { return "attraction:list" }
-func keyCap(attraction, date string) string     { return "cap:" + attraction + ":" + date }
-func keySalesRule(t model.PassType) string      { return "salesrule:" + string(t) }
-func keyHolidays() string                       { return "holidays" }
-func keyDedup(passID, attraction string) string { return "dedup:" + passID + ":" + attraction }
-func keyHighFreq(passID string) string          { return "hf:" + passID }
-func keyMultiLoc(passID string) string          { return "loc:" + passID }
-func keyManualReview(id string) string          { return "mreview:" + id }
-func keyVerifReview(verifID string) string      { return "verif:" + verifID + ":review" }
+func keyPass(id string) string                     { return "pass:" + id }
+func keyMember(id string) string                   { return "member:" + id }
+func keyPassMembers(id string) string              { return "pass:" + id + ":members" }
+func keyRemaining(id string) string                { return "pass:" + id + ":remaining" }
+func keyUsed(id string) string                     { return "pass:" + id + ":used" }
+func keyQRToken(id string) string                  { return "pass:" + id + ":qrtoken" }
+func keyIdxHolder(idCard string) string            { return "idx:holder:idcard:" + idCard }
+func keyIdxMember(idCard string) string            { return "idx:member:idcard:" + idCard }
+func keyIdxPhone(phone string) string              { return "idx:phone:" + phone }
+func keyIdxQR(token string) string                 { return "idx:qrtoken:" + token }
+func keyVerif(id string) string                    { return "verif:" + id }
+func keyVerifReq(reqID string) string              { return "verif:req:" + reqID }
+func keyPassVerifs(id string) string               { return "pass:" + id + ":verifs" }
+func keyGateLog(id string) string                  { return "glog:" + id }
+func keyGateLogList() string                       { return "glog:list" }
+func keyPassGateLogs(id string) string             { return "pass:" + id + ":glogs" }
+func keyDevice(id string) string                   { return "device:" + id }
+func keyDeviceList() string                        { return "device:list" }
+func keyReservation(id string) string              { return "rsv:" + id }
+func keyPassRsv(id string) string                  { return "pass:" + id + ":rsv" }
+func keyAppeal(id string) string                   { return "appeal:" + id }
+func keyAppealList() string                        { return "appeal:list" }
+func keyPassChanges(id string) string              { return "pass:" + id + ":changes" }
+func keyAttraction(id string) string               { return "attraction:" + id }
+func keyAttractionList() string                    { return "attraction:list" }
+func keyCap(attraction, date string) string        { return "cap:" + attraction + ":" + date }
+func keySalesRule(t model.PassType) string         { return "salesrule:" + string(t) }
+func keyHolidays() string                          { return "holidays" }
+func keyDedup(passID, attraction string) string    { return "dedup:" + passID + ":" + attraction }
+func keyHighFreq(passID string) string             { return "hf:" + passID }
+func keyMultiLoc(passID string) string             { return "loc:" + passID }
+func keyManualReview(id string) string             { return "mreview:" + id }
+func keyVerifReview(verifID string) string         { return "verif:" + verifID + ":review" }
+func keyFaceRisk(passID string) string             { return "pass:" + passID + ":facerisk" }
+func keyFaceRiskEvent(id string) string            { return "fre:" + id }
+func keyFreezeCase(id string) string               { return "fcase:" + id }
+func keyPassFreezeCase(passID string) string       { return "pass:" + passID + ":fcases" }
+func keyFreezeCaseList() string                    { return "fcase:list" }
+func keyUnfreezeApp(id string) string              { return "ufapp:" + id }
+func keyCaseUnfreezeApps(caseID string) string     { return "fcase:" + caseID + ":apps" }
+func keyUnfreezeAppList() string                   { return "ufapp:list" }
+func keyInPark(passID string) string               { return "inpark:" + passID }
+func keyRestrictedUsed(passID, date string) string { return "restricted:" + passID + ":" + date }
 
 // ---------- 时间辅助 ----------
 func dateOf(t time.Time) string { return t.Format("2006-01-02") }

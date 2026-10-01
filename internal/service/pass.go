@@ -161,7 +161,19 @@ func (s *Service) GetPassView(ctx context.Context, id string) (*model.PassView, 
 	remaining, _ := s.remainingQuota(ctx, id)
 	used, _ := s.usedQuota(ctx, id)
 	token, _ := s.St.R.Get(ctx, keyQRToken(id)).Result()
-	return &model.PassView{Pass: *p, RemainingQuota: remaining, UsedQuota: used, Members: members, QRToken: token}, nil
+	pending := 0
+	if rids, err := s.St.R.SMembers(ctx, keyPassRsv(id)).Result(); err == nil {
+		for _, rid := range rids {
+			var r model.Reservation
+			if err := s.St.GetJSON(ctx, keyReservation(rid), &r); err == nil && r.Status == "PENDING_VERIFICATION" {
+				pending++
+			}
+		}
+	}
+	return &model.PassView{
+		Pass: *p, RemainingQuota: remaining, UsedQuota: used, Members: members, QRToken: token,
+		InPark: s.isInPark(ctx, id), PendingReservation: pending,
+	}, nil
 }
 
 // FindPassesByPhone 按手机号查卡
@@ -217,14 +229,29 @@ func (s *Service) Unfreeze(ctx context.Context, id, operator string) (*model.Pas
 	if p.Status != model.PassStatusFrozen {
 		return nil, ErrPassNotFrozen
 	}
+	caseID := p.FreezeCaseID
 	p.Status = model.PassStatusActive
 	p.FreezeReason = ""
 	p.FrozenAt = nil
+	p.FreezeSource = ""
+	p.FreezeCaseID = ""
 	if err := s.savePass(ctx, p); err != nil {
 		return nil, err
 	}
+	// 若为高频异常冻结，手动解冻同时把案件结案（待核验预约保留，入园时补核销）
+	if caseID != "" {
+		var fc model.FreezeCase
+		if err := s.St.GetJSON(ctx, keyFreezeCase(caseID), &fc); err == nil && fc.Status == "FROZEN" {
+			now := time.Now()
+			fc.Status = "UNFROZEN"
+			fc.ResolvedAt = &now
+			fc.Resolver = operator
+			fc.Resolution = "客服手动解冻"
+			_ = s.St.SetJSON(ctx, keyFreezeCase(caseID), &fc)
+		}
+	}
 	s.statIncr(ctx, "stats:pass:frozen", -1)
-	s.addChangeLog(ctx, id, "UNFREEZE", "解冻，恢复入园权益", operator)
+	s.addChangeLog(ctx, id, "UNFREEZE", "解冻，恢复入园权益；待核验预约保留，入园时补核销", operator)
 	return p, nil
 }
 
@@ -266,11 +293,12 @@ func (s *Service) Refund(ctx context.Context, id, operator string) (*model.Pass,
 	}
 	// 权益清零
 	s.St.R.Set(ctx, keyRemaining(id), 0, 0)
-	// 未使用预约取消
+	// 未使用预约取消（含冻结期转入待核验的预约）
 	rsvIDs, _ := s.St.R.SMembers(ctx, keyPassRsv(id)).Result()
 	for _, rid := range rsvIDs {
 		var r model.Reservation
-		if err := s.St.GetJSON(ctx, keyReservation(rid), &r); err == nil && r.Status == "BOOKED" {
+		if err := s.St.GetJSON(ctx, keyReservation(rid), &r); err == nil &&
+			(r.Status == "BOOKED" || r.Status == "PENDING_VERIFICATION") {
 			r.Status = "CANCELLED"
 			_ = s.St.SetJSON(ctx, keyReservation(rid), &r)
 		}

@@ -63,11 +63,15 @@ func (s *Service) ListDevices(ctx context.Context) ([]DeviceView, error) {
 
 // ---------- 预约 ----------
 
-// CreateReservation 预约。冻结卡不可新预约；已冻结卡的既有预约不受冻结/解冻影响。
+// CreateReservation 预约。冻结/限制卡不可新预约；已冻结卡的既有预约不受冻结/解冻影响
+// （转借高频异常冻结时既有预约转为 PENDING_VERIFICATION，解冻后入园补核销）。
 func (s *Service) CreateReservation(ctx context.Context, passID, attraction, date, slot string) (*model.Reservation, error) {
 	p, err := s.getPass(ctx, passID)
 	if err != nil {
 		return nil, err
+	}
+	if p.Status == model.PassStatusRestricted {
+		return nil, ErrRestricted
 	}
 	if p.Status != model.PassStatusActive {
 		return nil, ErrPassNotActive

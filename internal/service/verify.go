@@ -27,13 +27,14 @@ type VerifyRequest struct {
 
 // VerifyResult 核验响应
 type VerifyResult struct {
-	VerificationID string         `json:"verification_id"`
-	Decision       model.Decision `json:"decision"`
-	Reason         string         `json:"reason"`
-	Detail         string         `json:"detail"`
-	ChargedQuota   int            `json:"charged_quota"`
-	RemainingQuota int            `json:"remaining_quota"`
-	DuplicateOf    string         `json:"duplicate_of,omitempty"`
+	VerificationID   string         `json:"verification_id"`
+	Decision         model.Decision `json:"decision"`
+	Reason           string         `json:"reason"`
+	Detail           string         `json:"detail"`
+	ChargedQuota     int            `json:"charged_quota"`
+	RemainingQuota   int            `json:"remaining_quota"`
+	DuplicateOf      string         `json:"duplicate_of,omitempty"`
+	AutoFreezeCaseID string         `json:"auto_freeze_case_id,omitempty"` // 本次不匹配触发高频异常自动冻结时的案件
 }
 
 // runCharge 执行原子扣减脚本，返回 {code, charged, extra}
@@ -148,8 +149,26 @@ func (s *Service) Verify(ctx context.Context, req VerifyRequest) (*VerifyResult,
 		return s.finish(ctx, v, p, model.DecisionQuota, model.ReasonPassRefunded, "年卡已退款，权益已清零"), nil
 	}
 	if p.Status == model.PassStatusFrozen {
-		return s.finish(ctx, v, p, model.DecisionManual, model.ReasonPassFrozen,
-			"年卡已冻结："+p.FreezeReason), nil
+		// 冻结只限制新的入园动作；持卡人已在园区内的不追溯驱离
+		detail := "年卡已冻结：" + p.FreezeReason + "，无法办理新的入园"
+		if s.isInPark(ctx, p.ID) {
+			detail += "；持卡人已在园区内，本次不追溯驱离，可继续游览，但请勿再刷闸尝试新的入园"
+		}
+		if p.FreezeSource == "risk_auto" {
+			detail += "；可提交本人证件与近期照片申请解冻"
+		}
+		return s.finish(ctx, v, p, model.DecisionManual, model.ReasonPassFrozen, detail), nil
+	}
+	if p.Status == model.PassStatusRestricted {
+		// 确认转借后的限制：不可携同行人、每日限本人入园 1 人次
+		if len(req.Companions) > 0 {
+			return s.finish(ctx, v, p, model.DecisionManual, model.ReasonRestricted,
+				"该年卡因确认转借处于权益限制期，不可携带同行人入园"), nil
+		}
+		if used, _ := s.St.R.Get(ctx, keyRestrictedUsed(p.ID, date)).Int(); used >= p.RestrictedDailyQuota {
+			return s.finish(ctx, v, p, model.DecisionManual, model.ReasonRestricted,
+				fmt.Sprintf("权益限制期每日限本人入园 %d 次，今日额度已用完", p.RestrictedDailyQuota)), nil
+		}
 	}
 	if date > p.ValidUntil {
 		return s.finish(ctx, v, p, model.DecisionQuota, model.ReasonPassExpired,
@@ -244,8 +263,16 @@ func (s *Service) Verify(ctx context.Context, req VerifyRequest) (*VerifyResult,
 			"现场采集照片不清晰，无法完成人脸比对"), nil
 	}
 	if req.FaceScore < FacePassScore {
-		return s.finish(ctx, v, p, model.DecisionManual, model.ReasonFaceMismatch,
-			fmt.Sprintf("人脸比对得分 %.1f 低于阈值 %.0f", req.FaceScore, FacePassScore)), nil
+		res := s.finish(ctx, v, p, model.DecisionManual, model.ReasonFaceMismatch,
+			fmt.Sprintf("人脸比对得分 %.1f 低于阈值 %.0f", req.FaceScore, FacePassScore))
+		// 登记人脸不匹配风险事件；满足一周内多入口多次不匹配规则时自动临时冻结
+		if fc := s.RecordFaceRiskEvent(ctx, v); fc != nil {
+			res.AutoFreezeCaseID = fc.ID
+			res.Detail += fmt.Sprintf("；该卡已触发转借高频异常临时冻结（案件 %s），已预约订单转待核验，可提交证件与近期照片申请解冻", fc.ID)
+			v.Detail = res.Detail
+			_ = s.St.SetJSON(ctx, keyVerif(v.ID), v)
+		}
+		return res, nil
 	}
 
 	// 9) 放行去重快速路径：同一游客同一景点在去重窗口内已放行 → 视为同一次入园
@@ -283,6 +310,11 @@ func (s *Service) Verify(ctx context.Context, req VerifyRequest) (*VerifyResult,
 	switch code {
 	case 1: // 放行
 		v.ChargedQuota = int(charged)
+		if p.Status == model.PassStatusRestricted {
+			s.St.R.Incr(ctx, keyRestrictedUsed(p.ID, date))
+			s.St.R.Expire(ctx, keyRestrictedUsed(p.ID, date), 48*time.Hour)
+		}
+		s.markInPark(ctx, p.ID, req.Attraction)
 		s.recordEntryStats(ctx, date, ts.Hour(), p.Type, req.Attraction, v.ChargedQuota)
 		s.markReservationUsed(ctx, p.ID, req.Attraction, date)
 		return s.finish(ctx, v, p, model.DecisionAllow, model.ReasonNone,
@@ -350,13 +382,14 @@ func (s *Service) writeGateLog(ctx context.Context, v *model.Verification, actio
 	}
 }
 
-// markReservationUsed 入园成功后核销当天预约
+// markReservationUsed 入园成功后核销当天预约（含解冻后待核验预约的补核销）
 func (s *Service) markReservationUsed(ctx context.Context, passID, attraction, date string) {
 	ids, _ := s.St.R.SMembers(ctx, keyPassRsv(passID)).Result()
 	for _, id := range ids {
 		var r model.Reservation
 		if err := s.St.GetJSON(ctx, keyReservation(id), &r); err == nil {
-			if r.Status == "BOOKED" && r.Attraction == attraction && r.Date == date {
+			if r.Attraction == attraction && r.Date == date &&
+				(r.Status == "BOOKED" || r.Status == "PENDING_VERIFICATION") {
 				r.Status = "USED"
 				_ = s.St.SetJSON(ctx, keyReservation(id), &r)
 			}
@@ -421,6 +454,22 @@ func (s *Service) ManualReview(ctx context.Context, verifID string, in ManualRev
 	if v.ManualAction != "" {
 		return nil, ErrAlreadyProcessed
 	}
+	// 冻结/受限卡不允许人工放行新的入园（在园持卡人不驱离，但不新增入园动作）
+	if in.Action == "RELEASE" && v.PassID != "" {
+		if p, err := s.getPass(ctx, v.PassID); err == nil {
+			if p.Status == model.PassStatusFrozen {
+				return nil, fmt.Errorf("%w: pass frozen, new entries are blocked; guide holder to unfreeze application", ErrPassNotActive)
+			}
+			if p.Status == model.PassStatusRestricted {
+				if len(v.Companions) > 0 {
+					return nil, ErrRestricted
+				}
+				if used, _ := s.St.R.Get(ctx, keyRestrictedUsed(v.PassID, dateOf(v.CreatedAt))).Int(); used >= p.RestrictedDailyQuota {
+					return nil, ErrDailyEntryLimit
+				}
+			}
+		}
+	}
 	token, ok, err := s.St.Lock(ctx, "verif:"+verifID, 5*time.Second)
 	if err != nil {
 		return nil, err
@@ -456,13 +505,24 @@ func (s *Service) ManualReview(ctx context.Context, verifID string, in ManualRev
 		v.Detail += fmt.Sprintf("；人工放行 by %s：%s", in.Operator, in.Note)
 		p, _ := s.getPass(ctx, v.PassID)
 		if p != nil {
+			// 仅真实产生新入园（code=1）时占用限制期每日额度并写在园标记
+			if p.Status == model.PassStatusRestricted && code == 1 {
+				s.St.R.Incr(ctx, keyRestrictedUsed(v.PassID, date))
+				s.St.R.Expire(ctx, keyRestrictedUsed(v.PassID, date), 48*time.Hour)
+			}
+			if code == 1 {
+				s.markInPark(ctx, v.PassID, v.Attraction)
+			}
 			s.recordEntryStats(ctx, date, v.CreatedAt.Hour(), p.Type, v.Attraction, mr.ChargedQuota)
 		}
+		s.markReservationUsed(ctx, v.PassID, v.Attraction, date)
+		s.markRiskEventReviewed(ctx, v)
 		s.statIncr(ctx, "stats:manual:"+date, 1)
 		s.writeGateLog(ctx, v, "MANUAL_RELEASE", in.Operator)
 	} else {
 		v.ManualAction = "REJECTED"
 		v.Detail += fmt.Sprintf("；人工拒绝 by %s：%s", in.Operator, in.Note)
+		s.markRiskEventReviewed(ctx, v)
 	}
 	id, _ := s.St.NextID(ctx, "mreview", "M")
 	mr.ID = id
@@ -500,6 +560,8 @@ return 1`)
 	if err := script.Run(ctx, s.St.R, []string{keyCap(req.Attraction, date)}, req.Count).Err(); err != nil {
 		return err
 	}
+	// 维护在园标记：出园后从该景点移除（用于冻结时判断持卡人是否已在园区内）
+	s.leavePark(ctx, req.PassID, req.Attraction)
 	v := &model.Verification{
 		ID: "EXIT-" + req.PassID + "-" + fmt.Sprint(time.Now().UnixNano()), PassID: req.PassID,
 		DeviceID: req.DeviceID, Attraction: req.Attraction, Decision: model.DecisionAllow,
